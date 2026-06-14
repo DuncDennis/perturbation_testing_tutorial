@@ -488,3 +488,9 @@ if __name__ == "__main__":
     plt.plot(x_line, y)
     plt.plot(x_line, x_)
     plt.show()
+
+
+def low_pass(z, time_last=False):
+    if not time_last:
+        return low_pass(z.transpose(1, 2), time_last=True).transpose(1, 2)
+    return torch.avg_pool1d(z, kernel_size=5, stride=1, padding=0)
