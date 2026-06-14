@@ -12,11 +12,17 @@ With use session 829720705 (Pvalb-Cre × Ai32, functional_connectivity*) which i
 
 ## Installation
 
-Install [uv](https://docs.astral.sh/uv/), then sync the environment (this pins
-the CUDA-12.6 PyTorch wheel — see `CLAUDE.md`):
+Install [uv](https://docs.astral.sh/uv/), then sync the environment:
 
 ```bash
 uv sync
+```
+
+This works everywhere (macOS, CPU-only PCs, etc.) and runs on CPU — or the
+Metal GPU on Apple Silicon. If you have an NVIDIA GPU, add the CUDA wheel:
+
+```bash
+uv sync --extra cu126
 ```
 
 ## Training a spontaneous-activity generator

@@ -11,14 +11,31 @@ dependencies = [
     "scikit-image>=0.24.0",
     "scikit-learn>=1.7.2",
     "scipy>=1.10.1",
-    "torch~=2.8",
+    "torch>=2.8",
     "tqdm>=4.67.3",
 ]
 
-# Pin PyTorch to the CUDA 12.6 wheel index — the system driver here
-# (max CUDA 12.8) cannot run wheels built against newer CUDA runtimes.
+# Pick a torch build at sync time:
+#   uv sync --extra cpu      # portable CPU wheel (macOS / no GPU / any laptop)
+#   uv sync --extra cu126    # NVIDIA GPU wheel (driver >= 12.6)
+# Plain `uv sync` uses the default PyPI wheel.
+[project.optional-dependencies]
+cpu = ["torch>=2.8"]
+cu126 = ["torch>=2.8"]
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "cu126" }]]
+
 [tool.uv.sources]
-torch = { index = "pytorch-cu126" }
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu126", extra = "cu126" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu126"

@@ -192,7 +192,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--model", choices=["rnn", "lif"], default="rnn")
     p.add_argument("--num-delays", type=int, default=3)
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--coeff_ta", type=float, default=1.0)
@@ -205,7 +205,12 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     if args.device == "auto":
-        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            args.device = "cuda"
+        elif torch.backends.mps.is_available():
+            args.device = "mps"
+        else:
+            args.device = "cpu"
     print(f"Using device: {args.device}")
 
     train(args)
