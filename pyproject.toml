@@ -1,0 +1,26 @@
+[project]
+name = "perturbation-testing-tutorial"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "allensdk~=2.16",
+    "hdmf==4.1.0",
+    "matplotlib>=3.10.9",
+    "numpy<2",
+    "pandas>=1.5.3",
+    "scikit-image>=0.24.0",
+    "scikit-learn>=1.7.2",
+    "scipy>=1.10.1",
+    "torch~=2.8",
+    "tqdm>=4.67.3",
+]
+
+# Pin PyTorch to the CUDA 12.6 wheel index — the system driver here
+# (max CUDA 12.8) cannot run wheels built against newer CUDA runtimes.
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
