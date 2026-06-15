@@ -8,7 +8,7 @@ It is a minimal reproduction of the results from Sourmpis et al., eLife 2026
 (https://elifesciences.org/articles/106827).
 
 We use data from the Allen institute Neuropixels dataset (see Siegle et al. 2021: https://www.nature.com/articles/s41586-020-03171-x). 
-We use session 829720705 (Pvalb-Cre × Ai32, functional_connectivity*) which includes optogenetic stimulation of PV neurons with simultaneous Neuropixels recordings.
+We use session 829720705 (Pvalb-Cre × Ai32, functional_connectivity) which includes optogenetic stimulation of PV neurons with simultaneous Neuropixels recordings.
 
 ## Installation
 
