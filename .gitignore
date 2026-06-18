@@ -1,2 +1,4 @@
 uv.lock
 *.pyc
+*.png
+*.log
