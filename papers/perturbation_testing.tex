@@ -238,7 +238,94 @@ numpy evaluation share a single feature pipeline so they cannot drift apart:
 (ii) project each channel onto a bank of log-spaced cosine/sine oscillation
 bands and take per-band amplitudes plus a DC term; (iii) z-score against the
 training-set statistics. Optimisation uses AdamW (learning rate $10^{-3}$, weight
-decay $0.1$); \code{apply\_constraint} runs after each step.
+decay $0.1$); \code{apply\_constraint} runs after each step. This is the
+``sample-and-measure'' paradigm of \cite{bellec2021}: generate freely, then
+penalise the dissimilarity between summary statistics of generated and recorded
+activity.
+
+\section{Theoretical background and related work}
+\label{sec:theory}
+This section explains \emph{why} the objective takes the form of
+Section~\ref{sec:loss}, and in particular why the generators are trained
+free-running rather than autoregressively.
+
+\subsection{Generative distribution matching, not likelihood}
+The networks are \emph{generative} models of spontaneous activity: noise is the
+only drive, and each \code{generate} call produces statistically independent
+trials. The training target is therefore the \emph{distribution} of activity, not
+the next spike given the recorded past. The classical alternative --- maximising
+the likelihood of the recorded spikes, as generalised linear models (GLMs) do ---
+clamps the network's trajectory to the data and optimises one-step-ahead
+conditionals. As \cite{bellec2021} showed, such likelihood-fit recurrent spiking
+networks ``do not produce realistic neural activity'' when run autonomously. The
+sample-and-measure approach instead back-propagates through stochastically
+simulated spike trains to match neuroscience summary statistics of the
+\emph{freely generated} activity, which is exactly the regime used at test time.
+
+\subsection{Why two complementary losses}
+The two terms constrain different statistical moments and neither suffices alone:
+\begin{itemize}[leftmargin=1.6em]
+\item $\mathcal{L}_{\mathrm{ta}}$ (the PSTH/$\mathcal{L}_{\mathrm{neuron}}$ term)
+pins down \emph{each neuron's} trial-averaged response --- mean rate and time
+course. But because it averages over trials, a degenerate model that emits the
+mean PSTH on every trial (zero variability) scores perfectly; the loss is blind
+to trial-to-trial structure. \cite{sourmpis2023} show PSTH-only models cannot
+reproduce, e.g., a bimodal single-trial distribution.
+\item $\mathcal{L}_{\mathrm{tm}}$ (the trial-matching term) pins down the
+\emph{distribution over single trials}. Since generated and recorded trials are
+unordered and independent (``no reason for generated trial $k$ to correspond to
+recorded trial $k$''), it uses optimal transport: an assignment between the two
+trial sets in feature space (Hungarian algorithm on a \emph{detached} cost,
+gradient through the matched entries) followed by a matched MSE. But on its own,
+the population-level features under-constrain individual neurons.
+\end{itemize}
+Together they yield correct single-neuron means \emph{and} correct population
+trial-to-trial covariability. The eval-time Brain-FID
+(Section~\ref{sec:metrics}) is the non-differentiable, distribution-level analogue
+of $\mathcal{L}_{\mathrm{tm}}$ on the same feature map.
+
+\subsection{Why free-running, not autoregressive / teacher-forced}
+Teacher forcing (feeding the recorded past as input) would be the autoregressive
+alternative. It is deliberately avoided here, for four reasons:
+\begin{enumerate}[leftmargin=1.8em]
+\item \textbf{Exposure bias.} A teacher-forced model conditions on \emph{true}
+past states during training but on its \emph{own} states at generation; the
+free-running dynamics it must ultimately produce are never directly optimised and
+can drift or destabilise. This train--test mismatch is the long-known motivation
+for fixes such as Professor Forcing \cite{lamb2016} and scheduled sampling.
+Sample-and-measure sidesteps it by optimising the autonomous dynamics directly.
+\item \textbf{The variability is the signal.} For spontaneous, noise-driven data
+there is no stimulus to ``predict from''. Teacher forcing would let the network
+lean on the clamped recorded past instead of learning the recurrent structure
+that \emph{generates} the observed variability --- which is precisely the
+scientific object of interest.
+\item \textbf{Perturbation testing requires autonomy.} The end goal is a
+counterfactual: inject the optogenetic current into PV units and predict the
+response. In that counterfactual there are \emph{no} recorded spikes to clamp to,
+so the model must run autonomously. A teacher-forced model has no validated
+free-running behaviour and cannot be used for this prediction.
+\item \textbf{Hidden neurons.} Clamping requires observing every neuron;
+sample-and-measure handles unobserved/hidden units naturally \cite{bellec2021}.
+\end{enumerate}
+Note the code still uses back-propagation \emph{within} a trial; it merely
+warm-starts each call from the \emph{detached} previous end state
+(\code{self.\_state = x.detach()}) and never conditions on recorded spikes, so
+there is no gradient coupling across calls and no teacher forcing.
+
+\subsection{Related work}
+GLM and maximum-likelihood recurrent spiking networks fit one-step conditionals
+with clamped trajectories and are the teacher-forced baseline criticised above.
+\cite{bellec2021} introduced the free-running sample-and-measure paradigm;
+\cite{sourmpis2023} added the optimal-transport trial-matching loss to capture
+variability; the present pipeline follows \cite{sourmpis2026}, which applies these
+models to optogenetic perturbation prediction. A different lineage ---
+sequential variational auto-encoders such as LFADS \cite{pandarinath2018} ---
+uses amortised inference to recover per-trial initial conditions and inferred
+inputs and \emph{reconstructs} observed trials; it excels at single-trial
+denoising but is not a pure free-running generator matched at the distribution
+level, and its inferred inputs complicate clean perturbation counterfactuals.
+Distribution-level generative models of spikes (GANs, latent diffusion) share the
+``match the distribution'' goal with very different, less mechanistic machinery.
 
 \section{Evaluation metrics}
 \label{sec:metrics}
@@ -352,6 +439,26 @@ J.\ H.\ Siegle et al.
 hierarchy.
 \newblock \emph{Nature}, 592:86--92, 2021.
 \newblock \url{https://www.nature.com/articles/s41586-020-03171-x}.
+
+\bibitem{bellec2021}
+G.\ Bellec, S.\ Wang, A.\ Modirshanechi, J.\ Brea, and W.\ Gerstner.
+\newblock Fitting summary statistics of neural data with a differentiable spiking
+network simulator.
+\newblock \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2021.
+\newblock \url{https://arxiv.org/abs/2106.10064}.
+
+\bibitem{pandarinath2018}
+C.\ Pandarinath et al.
+\newblock Inferring single-trial neural population dynamics using sequential
+auto-encoders (LFADS).
+\newblock \emph{Nature Methods}, 15:805--815, 2018.
+\newblock \url{https://www.nature.com/articles/s41592-018-0109-9}.
+
+\bibitem{lamb2016}
+A.\ Lamb, A.\ Goyal, Y.\ Zhang, S.\ Zhang, A.\ Courville, and Y.\ Bengio.
+\newblock Professor Forcing: a new algorithm for training recurrent networks.
+\newblock \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2016.
+\newblock \url{https://arxiv.org/abs/1610.09038}.
 \end{thebibliography}
 
 \end{document}
