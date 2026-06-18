@@ -19,7 +19,7 @@ from perturbation_testing import (evaluate, format_metrics, psth_pearson,
                                    make_population_oscillation_features,
                                    make_population_oscillation_features_torch,
                                    trial_matched_mse_loss)
-from models.rnn_and_spiking_rnn import RNN, LIF
+from models.rnn_and_spiking_rnn import RNN, LIF, lowBio
 from utils.functions import low_pass
 from utils.plot_rasters import plot_rasters, _share_yscale, matched_pairs
 
@@ -71,6 +71,8 @@ def train(args):
     sign = sign_per_neuron if args.sign_constrained else None
     if args.model == "lif":
         model = LIF(n_neurons, sign_vector=sign, num_delays=args.num_delays).to(device)
+    elif args.model == 'lowBio':
+        model = lowBio(n_neurons, sign_vector=sign, num_delays=args.num_delays, area_idx = area_per_neuron).to(device)
     else:
         model = RNN(n_neurons, sign_vector=sign).to(device)
     print(f"Model: {args.model}  n_neurons={n_neurons}  device={device}  "
@@ -190,7 +192,7 @@ def train(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--model", choices=["rnn", "lif"], default="rnn")
+    p.add_argument("--model", choices=["rnn", "lif", "lowBio"], default="rnn")
     p.add_argument("--num-delays", type=int, default=3)
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=64)
