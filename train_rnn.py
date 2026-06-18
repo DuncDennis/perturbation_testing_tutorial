@@ -62,6 +62,59 @@ def shuffled_baselines(z_true, seed=0, feature_fun=None):
     }
 
 
+def _plot_epoch_metrics(epoch_metrics, out_dir, baselines=None, m_ideal=None):
+    """Line plot of PSTH-r / Brain-FID / trial-R² over training epochs."""
+    epochs = [m["epoch"] for m in epoch_metrics]
+    specs = [
+        ("psth_pearson_r",   "PSTH Pearson r ↑",  "psth_shuffled_time", "psth_pearson_r"),
+        ("brain_fid",        "Brain FID ↓",        "fid_shuffled_time",  "brain_fid"),
+        ("trial_matched_r2", "Trial-matched R² ↑", "r2_shuffled_time",   "trial_matched_r2"),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
+    for ax, (key, label, bl_key, ideal_key) in zip(axes, specs):
+        ax.plot(epochs, [m[key] for m in epoch_metrics], "o-", ms=3, lw=1.5, label="model")
+        if baselines is not None:
+            ax.axhline(baselines[bl_key], color="C3", ls="--", lw=1,
+                       alpha=0.8, label="shuffle-time")
+        if m_ideal is not None:
+            ax.axhline(m_ideal[ideal_key], color="C2", ls="--", lw=1,
+                       alpha=0.8, label="ideal ceiling")
+        ax.set_xlabel("epoch")
+        ax.set_title(label)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+    fig.savefig(os.path.join(out_dir, "metrics_over_epochs.png"), dpi=120)
+    plt.close(fig)
+
+
+def _plot_perturb_metrics(perturb_results, out_dir):
+    """Bar chart comparing all perturbation conditions across the three metrics."""
+    conditions = [r["condition"] for r in perturb_results]
+    n = len(conditions)
+    specs = [
+        ("psth_pearson_r",   "PSTH Pearson r ↑"),
+        ("brain_fid",        "Brain FID ↓"),
+        ("trial_matched_r2", "Trial-matched R² ↑"),
+    ]
+    colors = ["C2" if "test" in c else "C0" if c == "sham" else "C1"
+              for c in conditions]
+    fig, axes = plt.subplots(1, 3, figsize=(max(9, n * 1.3 + 2), 5),
+                             constrained_layout=True)
+    x = np.arange(n)
+    for ax, (key, label) in zip(axes, specs):
+        vals = [r[key] for r in perturb_results]
+        ax.bar(x, vals, color=colors)
+        ax.set_xticks(x)
+        ax.set_xticklabels(conditions, rotation=40, ha="right", fontsize=8)
+        ax.axhline(0, color="k", lw=0.6)
+        ax.set_title(label)
+        ax.grid(True, axis="y", alpha=0.3)
+    fig.suptitle("Perturbation metrics — non-driven neurons only\n"
+                 "(green=test, blue=sham, orange=opto)")
+    fig.savefig(os.path.join(out_dir, "perturbation_metrics.png"), dpi=120)
+    plt.close(fig)
+
+
 def train(args):
     t0 = time.time()
     print("Loading data...")
@@ -120,14 +173,17 @@ def train(args):
     # Training raster figure: generated (right) artists are updated in place each epoch
     # and saved every --plot-every epochs.
     out_dir = args.run_dir
-    ti, tj = 0, z_te_bin.shape[0] // 2
+    n_te = z_te_bin.shape[0]
+    ti, tj, tk = 0, n_te // 3, 2 * n_te // 3
     examples = lambda gen: [("trial-avg", z_te_bin.mean(0), gen[0], None),
                             (f"trial {ti}", z_te_bin[ti], gen[1], None),
-                            (f"trial {tj}", z_te_bin[tj], gen[2], None)]
+                            (f"trial {tj}", z_te_bin[tj], gen[2], None),
+                            (f"trial {tk}", z_te_bin[tk], gen[3], None)]
     fig, gen, traces = plot_rasters(
-        examples([z_te_bin.mean(0), z_te_bin[ti], z_te_bin[tj]]),
+        examples([z_te_bin.mean(0), z_te_bin[ti], z_te_bin[tj], z_te_bin[tk]]),
         area_per_neuron, keep, "epoch 0")
 
+    epoch_metrics = []
     for epoch in range(1, args.epochs + 1):
         model.train()
         losses = {"trial_matched": [], "trial_averaged": []}
@@ -150,11 +206,13 @@ def train(args):
         z_pred = model.generate(len(z_te_bin), z_te_bin.shape[1], device=device)
         z_pred = z_pred.detach().cpu().numpy()
         metrics = evaluate(z_pred, z_te_bin, feature_fun=feature_fun, time_last=False)
+        metrics["epoch"] = epoch
+        epoch_metrics.append(metrics)
         loss_str = "  ".join(f"{k}={np.mean(v):.3f}" for k, v in losses.items())
         print(f"Epoch {epoch:3d}  {loss_str}  | test {format_metrics(metrics)}")
 
         for (im, sline, fline, bot), dat in zip(
-                gen, [z_pred.mean(0), z_pred[ti], z_pred[tj]]):
+                gen, [z_pred.mean(0), z_pred[ti], z_pred[tj], z_pred[tk]]):
             im.set_data(dat.T)
             sline.set_ydata(dat[:, keep].mean(1))
             if fline is not None:
@@ -165,17 +223,11 @@ def train(args):
             fig.savefig(os.path.join(out_dir, f"rasters_epoch_{epoch:03d}.png"), dpi=120)
 
     plt.close(fig)
+    _plot_epoch_metrics(epoch_metrics, out_dir, baselines=baselines, m_ideal=m_ideal)
 
-    # Perturbation set: raised-cosine LED at the strongest level, added as a
-    # shared current to the driven units each step -> (T, N).
-    light, z_pert, meta = get_perturbation_trials(time_last=False)   # (B, T, N)
-    sel = meta["stimulus_name"] == "raised_cosine"
-    sel &= meta["level"] == meta["level"][sel].max()
-    print(f"Perturbation set: raised_cosine @ level {meta['level'][sel][0]:.1f} ({int(sel.sum())} trials)")
-    z_pert, light = (z_pert[sel] > 0).astype(np.float32), light[sel]
-    light_t = torch.tensor(light.mean(0), dtype=torch.float32, device=device)   # (T,)
+    # --- Post-training evaluation ---
+    light_all, z_pert_all, meta = get_perturbation_trials(time_last=False)
     drive = torch.tensor(driven.astype(np.float32), device=device)
-    perturb_current = args.opto_intensity * light_t[:, None] * drive[None, :]    # (T, N)
 
     feature_fun_kept = make_population_oscillation_features(
         area_per_neuron=area_per_neuron[keep], z_train=z_tr_bin_full[:, :, keep], dt=DT)
@@ -188,7 +240,7 @@ def train(args):
         m = evaluate(z_g[:, :, keep], z_data[:, :, keep],
                      feature_fun=feature_fun_kept, time_last=False)
         print(f"{title} | {format_metrics(m)}")
-        pairs = matched_pairs(z_data[:, :, keep], z_g[:, :, keep], feature_fun_kept, k=2)
+        pairs = matched_pairs(z_data[:, :, keep], z_g[:, :, keep], feature_fun_kept, k=3)
         rows = [("trial-avg", z_data.mean(0), z_g.mean(0),
                  None if light is None else light.mean(0))]
         rows += [(f"gt{gj}/gen{gi}", z_data[gj], z_g[gi],
@@ -196,10 +248,39 @@ def train(args):
         fig, _, _ = plot_rasters(rows, area_per_neuron, keep, f"{title} — {format_metrics(m)}")
         fig.savefig(os.path.join(out_dir, name), dpi=120)
         plt.close(fig)
+        return m
 
-    final_plot("test_rasters.png", z_te_bin, None, "test (no perturbation)")
-    final_plot("perturbation_rasters.png", z_pert, perturb_current,
-               f"perturbation test (drive {int(driven.sum())} inhib units)", light=light)
+    # In-distribution test set (no perturbation).
+    m_test = final_plot("test_rasters.png", z_te_bin, None, "test (no perturbation)")
+    perturb_results = [{"condition": "test (in-dist)", **m_test}]
+
+    # All opto + sham conditions.
+    opto_sel = meta["kind"] == "opto"
+    sham_sel = meta["kind"] == "sham"
+
+    conditions = []
+    if sham_sel.any():
+        conditions.append(("sham", 0.0, sham_sel, None))
+    for stim_name in sorted(np.unique(meta["stimulus_name"][opto_sel])):
+        stim_sel = opto_sel & (meta["stimulus_name"] == stim_name)
+        for level in sorted(np.unique(meta["level"][stim_sel])):
+            cond_sel = stim_sel & (meta["level"] == level)
+            light_t = torch.tensor(
+                light_all[cond_sel].mean(0), dtype=torch.float32, device=device)
+            perturb_current = args.opto_intensity * light_t[:, None] * drive[None, :]
+            conditions.append((stim_name, level, cond_sel, perturb_current))
+
+    for stim_name, level, cond_sel, perturb_current in conditions:
+        n = int(cond_sel.sum())
+        label = "sham" if stim_name == "sham" else f"{stim_name} l={level:.1f}"
+        fname = f"perturbation_{stim_name}_l{level:.1f}.png"
+        z_cond = (z_pert_all[cond_sel] > 0).astype(np.float32)
+        light_arg = None if stim_name == "sham" else light_all[cond_sel]
+        print(f"Perturb: {label} ({n} trials)")
+        m = final_plot(fname, z_cond, perturb_current, label, light=light_arg)
+        perturb_results.append({"condition": label, **m})
+
+    _plot_perturb_metrics(perturb_results, out_dir)
 
 
 if __name__ == "__main__":
