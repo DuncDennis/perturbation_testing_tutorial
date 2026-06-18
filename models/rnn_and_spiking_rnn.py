@@ -141,82 +141,79 @@ class LIF(RNN):
         return torch.stack(out, dim=1)
 
 class lowRNN(nn.Module):
-    """Vanilla rate RNN and shared base for the spontaneous-activity generators.
+    """Rate RNN with low-rank inter-area connectivity and full-rank intra-area blocks.
 
-    Dynamics: x_t = relu(x_{t-1} @ W + b + noise). No external input — the noise
-    is the only drive. `sign_vector` (optional) enables Dale's law: W is init
-    sign-constrained and E/I-balanced (Sourmpis 2023) and `apply_constraint`
-    re-projects the signs after every optimizer step. `LIF` derives from this.
+    Area structure is always active (area_idx is required). Sign constraints and
+    inter-area Dale's law are each optional:
+      - sign_vector=None          → all blocks unconstrained
+      - sign_vector + inter_area_dale=False → intra-area sign-constrained, inter-area free
+      - sign_vector + inter_area_dale=True  → both intra- and inter-area sign-constrained
+
+    Each intra-area block is a full (N_a × N_a) weight matrix.
+    Each inter-area block is rank-R: W = sign_src[:,None] * (M @ N.T) when
+    constrained (M, N ≥ 0); W = M @ N.T when unconstrained.
     """
 
-    def __init__(self, n_neurons, area_idx, sign_vector=None, rank=2):
+    def __init__(self, n_neurons, area_idx, sign_vector=None, rank=2,
+                 inter_area_dale=False):
         super().__init__()
         self.n_neurons = n_neurons
         self.rank = rank
         self.W_dict = nn.ModuleDict()
-        if sign_vector is not None:
-            if area_idx is None:
-                raise ValueError("area_idx is required for low-rank regional connectivity")
-            area_idx = np.asarray(area_idx)
-            sign_vector = np.asarray(sign_vector)
-            if len(area_idx) != n_neurons:
-                raise ValueError(
-                    f"area_idx length {len(area_idx)} does not match n_neurons {n_neurons}")
-            if len(sign_vector) != n_neurons:
-                raise ValueError(
-                    f"sign_vector length {len(sign_vector)} does not match n_neurons {n_neurons}")
 
-            # Looping through brain regions. Each block is stored as target_source
-            # but later stitched into W[source, target] for the x @ W convention.
-            self.areas = np.unique(area_idx)
-            self.area_indices = {
-                area: torch.as_tensor(np.where(area_idx == area)[0], dtype=torch.long)
-                for area in self.areas
-            }
-            for tgt in self.areas:
-                for src in self.areas:
-                    # Key for intra & inter connectivity
-                    key = f"{tgt}_{src}"
-                    src_idx = self.area_indices[src]
-                    tgt_idx = self.area_indices[tgt]
-                    if tgt == src:
-                        sign_vector_tgt = sign_vector[tgt_idx.cpu().numpy()]
-                        W0_tgt, sign_matrix_tgt = init_signed_W(sign_vector_tgt, p0=0.5)
-                        assert torch.all(torch.tensor(sign_vector_tgt)[:, None] * W0_tgt >= 0), "wrong signs"
-                        # Store the parameters
-                        self.W_dict[key] = nn.ParameterDict({
-                            "W": nn.Parameter(W0_tgt),
-                        })
-                        # Register the buffer 
-                        self.W_dict[key].register_buffer("sign_matrix", sign_matrix_tgt)
+        area_idx = np.asarray(area_idx)
+        sign_vector = np.asarray(sign_vector) if sign_vector is not None else None
+
+        self.areas = np.unique(area_idx)
+        self.area_indices = {
+            area: torch.as_tensor(np.where(area_idx == area)[0], dtype=torch.long)
+            for area in self.areas
+        }
+
+        for tgt in self.areas:
+            tgt_idx = self.area_indices[tgt]
+            for src in self.areas:
+                src_idx = self.area_indices[src]
+                key = f"{tgt}_{src}"
+                if tgt == src:
+                    n_tgt = len(tgt_idx)
+                    if sign_vector is not None:
+                        sv_tgt = sign_vector[tgt_idx.cpu().numpy()]
+                        W0, sm = init_signed_W(sv_tgt, p0=0.5)
+                        assert torch.all(torch.tensor(sv_tgt)[:, None] * W0 >= 0)
                     else:
-                        # Initialize low-rank connectivity 
-                        self.W_dict[key] = nn.ParameterDict({
-                            "M": nn.Parameter(torch.randn(len(src_idx), rank) * 0.02),
-                            "N": nn.Parameter(torch.randn(len(tgt_idx), rank) * 0.02),
-                        })
+                        W0 = torch.randn(n_tgt, n_tgt) / n_tgt ** 0.5
+                        sm = None
+                    self.W_dict[key] = nn.ParameterDict({"W": nn.Parameter(W0)})
+                    self.W_dict[key].register_buffer("sign_matrix", sm)
+                else:
+                    constrain = sign_vector is not None and inter_area_dale
+                    if constrain:
+                        sign_src = torch.as_tensor(
+                            sign_vector[src_idx.cpu().numpy()], dtype=torch.float32)
+                        # M, N initialised non-negative; sign_src provides the row sign.
+                        M0 = torch.rand(len(src_idx), rank) * 0.02
+                        N0 = torch.rand(len(tgt_idx), rank) * 0.02
+                    else:
+                        sign_src = None
+                        M0 = torch.randn(len(src_idx), rank) * 0.02
+                        N0 = torch.randn(len(tgt_idx), rank) * 0.02
+                    self.W_dict[key] = nn.ParameterDict({
+                        "M": nn.Parameter(M0),
+                        "N": nn.Parameter(N0),
+                    })
+                    self.W_dict[key].register_buffer("sign_src", sign_src)
 
-        else:
-            self.W = nn.Parameter(torch.randn(n_neurons, n_neurons) / n_neurons ** 0.5)
-            self.sign_matrix = None
-            
         self.b = nn.Parameter(torch.zeros(n_neurons))
-        # Noise is the only drive of this spontaneous generator, so it must start
-        # nonzero — otherwise a ReLU rate net sits at x=relu(0)=0 with zero
-        # gradient and never learns.
         self.sigma_noise = nn.Parameter(torch.ones(n_neurons) * 0.1)
         self.scale = nn.Parameter(torch.ones(1))
 
     def get_global_W(self):
-        """Assemble the regional block ModuleDict into a dense (N, N) matrix.
+        """Assemble regional blocks into a dense (N, N) matrix.
 
-        The recurrence uses `x @ W`, so rows are source/presynaptic neurons and
-        columns are target/postsynaptic neurons. Intra-area blocks are stored
-        directly as `W`; inter-area blocks are low-rank factors `M @ N.T`.
+        Convention: W[i, j] = weight from presynaptic i to postsynaptic j
+        (recurrence applied as x @ W).
         """
-        if len(self.W_dict) == 0:
-            return self.W
-
         ref = next(self.parameters())
         W = ref.new_zeros(self.n_neurons, self.n_neurons)
         for tgt in self.areas:
@@ -226,6 +223,9 @@ class lowRNN(nn.Module):
                 block = self.W_dict[f"{tgt}_{src}"]
                 if "W" in block:
                     W_block = block["W"]
+                elif block.sign_src is not None:
+                    W_block = block.sign_src.to(ref.device)[:, None] * (
+                        block["M"] @ block["N"].T)
                 else:
                     W_block = block["M"] @ block["N"].T
                 W[src_idx[:, None], tgt_idx[None, :]] = W_block
@@ -235,40 +235,33 @@ class lowRNN(nn.Module):
 
     @torch.no_grad()
     def apply_constraint(self):
-        """Call after each optimizer step: zero the diagonal, enforce Dale's-law
-        signs (if constrained), and re-pin the spectral radius. The recurrence has
-        little/no leak, so without this scale control an expansive W blows the
-        dynamics up to inf over a trial (the E/I matrix is strongly non-normal)."""
-        if len(self.W_dict) == 0:
-            self.W.data.fill_diagonal_(0.0)
-            if self.sign_matrix is not None:
-                sm = self.sign_matrix
-                self.W.data[sm > 0] = self.W[sm > 0].clamp(min=0)
-                self.W.data[sm < 0] = self.W[sm < 0].clamp(max=0)
-        else:
-            for block in self.W_dict.values():
-                if "W" not in block:
-                    continue
+        """Re-project signs and re-pin spectral radius after each optimizer step."""
+        for block in self.W_dict.values():
+            if "W" in block:
                 block["W"].data.fill_diagonal_(0.0)
-                sm = block.sign_matrix
-                block["W"].data[sm > 0] = block["W"][sm > 0].clamp(min=0)
-                block["W"].data[sm < 0] = block["W"][sm < 0].clamp(max=0)
-
-        # Force stabilization with matrix eigenalues
+                if block.sign_matrix is not None:
+                    sm = block.sign_matrix
+                    block["W"].data[sm > 0] = block["W"][sm > 0].clamp(min=0)
+                    block["W"].data[sm < 0] = block["W"][sm < 0].clamp(max=0)
+            else:
+                if block.sign_src is not None:
+                    # Keep M, N ≥ 0 so sign_src exclusively controls row sign.
+                    block["M"].data.clamp_(min=0)
+                    block["N"].data.clamp_(min=0)
 
         spectral_radius_max = 1.2
         W = self.get_global_W()
         eig = torch.linalg.eigvals(W.cpu()).abs().max()
         if eig > spectral_radius_max:
             scale = float(spectral_radius_max / eig)
-            if len(self.W_dict) == 0:
-                self.W.data.mul_(scale)
-            else:
-                for block in self.W_dict.values():
-                    if "W" in block:
-                        block["W"].data.mul_(scale)
-                    else:
-                        block["M"].data.mul_(scale)
+            sq = scale ** 0.5
+            for block in self.W_dict.values():
+                if "W" in block:
+                    block["W"].data.mul_(scale)
+                else:
+                    # Symmetric scaling: (sq·M)@(sq·N).T = scale·M@N.T
+                    block["M"].data.mul_(sq)
+                    block["N"].data.mul_(sq)
 
     def generate(self, B, T, device=None, perturb_current=None):
         # perturb_current: (T, N) added to the pre-activation — the PV-opto hook
@@ -306,8 +299,9 @@ class lowBio(lowRNN):
     own delay in the past.
     """ 
     def __init__(self, n_neurons, sign_vector=None, al=0.5, v_thr=0.1,
-                 num_delays=3, area_idx=None, rank=2):
-        super().__init__(n_neurons, area_idx, sign_vector, rank=rank)
+                 num_delays=3, area_idx=None, rank=2, inter_area_dale=False):
+        super().__init__(n_neurons, area_idx, sign_vector, rank=rank,
+                         inter_area_dale=inter_area_dale)
         self.register_buffer("al", torch.tensor(float(al)))
         self.register_buffer("v_thr", torch.tensor(float(v_thr)))
         W_d = nn.functional.one_hot(

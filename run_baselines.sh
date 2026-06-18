@@ -1,21 +1,48 @@
 #!/usr/bin/env bash
-# Run all 4 model × sign-constraint combinations and save results to
-# figures/<model>_{un,sign_}constrained/.
+# Run all model × sign-constraint × (rank / inter-dale) combinations.
+# Results go to figures/<model>_{un,sign_constrained}[_interdale][_rank<R>]/.
+#
+# Total runs:
+#   RNN / LIF : 2 × 2 = 4
+#   lowRNN / lowBio : 2 models × (4 unconstrained + 4 sign_constrained + 4 interdale) = 24
+#   Grand total: 28
 set -e
 
 PYTHON=".venv/bin/python"
+EPOCHS=20
 
-echo "=== 1/4  RNN  unconstrained ==="
-$PYTHON train_rnn.py --model rnn --epochs 100
+# ── RNN ──────────────────────────────────────────────────────────────────────
+echo "=== RNN  unconstrained ==="
+$PYTHON train_rnn.py --model rnn --epochs $EPOCHS
 
-echo "=== 2/4  RNN  sign-constrained ==="
-$PYTHON train_rnn.py --model rnn --sign-constrained --epochs 100
+echo "=== RNN  sign-constrained ==="
+$PYTHON train_rnn.py --model rnn --sign-constrained --epochs $EPOCHS
 
-echo "=== 3/4  LIF  unconstrained ==="
-$PYTHON train_rnn.py --model lif --epochs 100
+# ── LIF ──────────────────────────────────────────────────────────────────────
+echo "=== LIF  unconstrained ==="
+$PYTHON train_rnn.py --model lif --epochs $EPOCHS
 
-echo "=== 4/4  LIF  sign-constrained ==="
-$PYTHON train_rnn.py --model lif --sign-constrained --epochs 100
+echo "=== LIF  sign-constrained ==="
+$PYTHON train_rnn.py --model lif --sign-constrained --epochs $EPOCHS
 
-echo "Done. Results in figures/rnn_unconstrained/, figures/rnn_sign_constrained/,"
-echo "      figures/lif_unconstrained/, figures/lif_sign_constrained/"
+# ── lowRNN / lowBio : sweep rank × sign-constraint × inter-area Dale's law ──
+for MODEL in lowRNN lowBio; do
+    for RANK in 1 2 3 4; do
+        echo "=== $MODEL  unconstrained  rank=$RANK ==="
+        $PYTHON train_rnn.py --model $MODEL --epochs $EPOCHS --rank $RANK
+
+        echo "=== $MODEL  sign-constrained  rank=$RANK ==="
+        $PYTHON train_rnn.py --model $MODEL --sign-constrained --epochs $EPOCHS --rank $RANK
+
+        echo "=== $MODEL  sign-constrained  inter-dale  rank=$RANK ==="
+        $PYTHON train_rnn.py --model $MODEL --sign-constrained --inter-area-dale \
+            --epochs $EPOCHS --rank $RANK
+    done
+done
+
+echo ""
+echo "Done. Output directories:"
+echo "  figures/rnn_{un,sign_constrained}/"
+echo "  figures/lif_{un,sign_constrained}/"
+echo "  figures/{lowRNN,lowBio}_{unconstrained,sign_constrained,sign_constrained_interdale}_rank{1..4}/"
+echo "Each contains opto_0.10/, opto_0.50/, opto_1.00/ perturbation sub-dirs."

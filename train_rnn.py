@@ -19,7 +19,7 @@ from perturbation_testing import (evaluate, format_metrics, psth_pearson,
                                    make_population_oscillation_features,
                                    make_population_oscillation_features_torch,
                                    trial_matched_mse_loss)
-from models.rnn_and_spiking_rnn import RNN, LIF, lowBio
+from models.rnn_and_spiking_rnn import RNN, LIF, lowRNN, lowBio
 from utils.functions import low_pass
 from utils.plot_rasters import plot_rasters, _share_yscale, matched_pairs
 
@@ -139,7 +139,13 @@ def train(args):
     if args.model == "lif":
         model = LIF(n_neurons, sign_vector=sign, num_delays=args.num_delays).to(device)
     elif args.model == 'lowBio':
-        model = lowBio(n_neurons, sign_vector=sign, num_delays=args.num_delays, area_idx = area_per_neuron).to(device)
+        model = lowBio(n_neurons, sign_vector=sign, num_delays=args.num_delays,
+                       area_idx=area_per_neuron, rank=args.rank,
+                       inter_area_dale=args.inter_area_dale).to(device)
+    elif args.model == 'lowRNN':
+        model = lowRNN(n_neurons, area_idx=area_per_neuron, sign_vector=sign,
+                       rank=args.rank,
+                       inter_area_dale=args.inter_area_dale).to(device)
     else:
         model = RNN(n_neurons, sign_vector=sign).to(device)
     print(f"Model: {args.model}  n_neurons={n_neurons}  device={device}  "
@@ -236,7 +242,7 @@ def train(args):
     print(f"Eval masks out {int(driven.sum())} opto-driven units; scoring on "
           f"{int(keep.sum())}/{len(keep)} non-driven units.")
 
-    def final_plot(name, z_data, perturb, title, light=None):
+    def final_plot(name, z_data, perturb, title, save_dir, light=None):
         z_g = model.generate(len(z_data), z_data.shape[1], device=device,
                              perturb_current=perturb).detach().cpu().numpy()
         m = evaluate(z_g[:, :, keep], z_data[:, :, keep],
@@ -248,53 +254,65 @@ def train(args):
         rows += [(f"gt{gj}/gen{gi}", z_data[gj], z_g[gi],
                   None if light is None else light[gj]) for gj, gi, _ in pairs]
         fig, _, _ = plot_rasters(rows, area_per_neuron, keep, f"{title} — {format_metrics(m)}")
-        fig.savefig(os.path.join(out_dir, name), dpi=120)
+        fig.savefig(os.path.join(save_dir, name), dpi=120)
         plt.close(fig)
         return m
 
-    # In-distribution test set (no perturbation).
-    m_test = final_plot("test_rasters.png", z_te_bin, None, "test (no perturbation)")
-    perturb_results = [{"condition": "test (in-dist)", **m_test}]
-
-    # All opto + sham conditions.
+    # Build conditions once: sham has light_t=None; opto stores the raw light tensor
+    # (not yet scaled by intensity) so we can sweep intensities without reloading.
     opto_sel = meta["kind"] == "opto"
     sham_sel = meta["kind"] == "sham"
-
-    conditions = []
+    base_conditions = []
     if sham_sel.any():
-        conditions.append(("sham", 0.0, sham_sel, None))
+        base_conditions.append(("sham", 0.0, sham_sel, None))
     for stim_name in sorted(np.unique(meta["stimulus_name"][opto_sel])):
         stim_sel = opto_sel & (meta["stimulus_name"] == stim_name)
         for level in sorted(np.unique(meta["level"][stim_sel])):
             cond_sel = stim_sel & (meta["level"] == level)
             light_t = torch.tensor(
                 light_all[cond_sel].mean(0), dtype=torch.float32, device=device)
-            perturb_current = args.opto_intensity * light_t[:, None] * drive[None, :]
-            conditions.append((stim_name, level, cond_sel, perturb_current))
+            base_conditions.append((stim_name, level, cond_sel, light_t))
 
-    for stim_name, level, cond_sel, perturb_current in conditions:
-        n = int(cond_sel.sum())
-        label = "sham" if stim_name == "sham" else f"{stim_name} l={level:.1f}"
-        fname = f"perturbation_{stim_name}_l{level:.1f}.png"
-        z_cond = (z_pert_all[cond_sel] > 0).astype(np.float32)
-        light_arg = None if stim_name == "sham" else light_all[cond_sel]
-        print(f"Perturb: {label} ({n} trials)")
-        m = final_plot(fname, z_cond, perturb_current, label, light=light_arg)
-        perturb_results.append({"condition": label, **m})
+    for opto_intensity in args.opto_intensities:
+        intensity_dir = os.path.join(out_dir, f"opto_{opto_intensity:.2f}")
+        os.makedirs(intensity_dir, exist_ok=True)
+        print(f"\n--- Perturbation sweep: opto_intensity={opto_intensity} ---")
 
-    _plot_perturb_metrics(perturb_results, out_dir)
+        m_test = final_plot("test_rasters.png", z_te_bin, None,
+                            "test (no perturbation)", intensity_dir)
+        perturb_results = [{"condition": "test (in-dist)", **m_test}]
+
+        for stim_name, level, cond_sel, light_t in base_conditions:
+            label = "sham" if stim_name == "sham" else f"{stim_name} l={level:.1f}"
+            fname = f"perturbation_{stim_name}_l{level:.1f}.png"
+            z_cond = (z_pert_all[cond_sel] > 0).astype(np.float32)
+            light_arg = None if stim_name == "sham" else light_all[cond_sel]
+            perturb_current = (None if light_t is None
+                               else opto_intensity * light_t[:, None] * drive[None, :])
+            n = int(cond_sel.sum())
+            print(f"Perturb: {label} ({n} trials)")
+            m = final_plot(fname, z_cond, perturb_current, label,
+                           intensity_dir, light=light_arg)
+            perturb_results.append({"condition": label, **m})
+
+        _plot_perturb_metrics(perturb_results, intensity_dir)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--model", choices=["rnn", "lif", "lowBio"], default="rnn")
+    p.add_argument("--model", choices=["rnn", "lif", "lowRNN", "lowBio"], default="rnn")
     p.add_argument("--num-delays", type=int, default=3)
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--coeff_ta", type=float, default=1.0)
     p.add_argument("--coeff_tm", type=float, default=0.3)
-    p.add_argument("--opto_intensity", type=float, default=0.5)
+    p.add_argument("--rank", type=int, default=2,
+                   help="inter-area low-rank (lowRNN / lowBio only)")
+    p.add_argument("--inter-area-dale", action="store_true", dest="inter_area_dale",
+                   help="enforce Dale's law for inter-area connections (lowRNN/lowBio only)")
+    p.add_argument("--opto-intensities", type=float, nargs="+",
+                   default=[0.1, 0.5, 1.0], dest="opto_intensities")
     p.add_argument("--plot-every", type=int, default=5,
                    help="save a training raster every N epochs (0 = never)")
     p.add_argument("--sign-constrained", action="store_true")
@@ -312,9 +330,15 @@ if __name__ == "__main__":
             args.device = "cpu"
 
     if args.run_dir is None:
+        is_low = args.model in ("lowRNN", "lowBio")
+        rank_suffix = f"_rank{args.rank}" if is_low else ""
+        dale_suffix = ("_interdale"
+                       if is_low and args.sign_constrained and args.inter_area_dale
+                       else "")
         args.run_dir = os.path.join(
             "figures",
             f"{args.model}_{'sign_constrained' if args.sign_constrained else 'unconstrained'}"
+            f"{dale_suffix}{rank_suffix}"
         )
     os.makedirs(args.run_dir, exist_ok=True)
 
