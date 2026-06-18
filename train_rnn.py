@@ -103,8 +103,13 @@ def train(args):
                        time_last=False)
     print(f"  ideal (train->test) : {format_metrics(m_ideal)}")
 
-    # Live rasters; the generated (right) artists are updated in place each epoch.
-    plt.ion()
+    # Training raster figure: generated (right) artists are updated in place each epoch
+    # and saved every --plot-every epochs.
+    out_dir = args.run_dir or os.path.join(
+        "figures",
+        f"{args.model}_{'sign_constrained' if args.sign_constrained else 'unconstrained'}"
+    )
+    os.makedirs(out_dir, exist_ok=True)
     ti, tj = 0, z_te_bin.shape[0] // 2
     examples = lambda gen: [("trial-avg", z_te_bin.mean(0), gen[0], None),
                             (f"trial {ti}", z_te_bin[ti], gen[1], None),
@@ -146,11 +151,10 @@ def train(args):
                 fline.set_ydata(dat.mean(1))
         _share_yscale(traces)
         fig.suptitle(f"epoch {epoch}")
-        fig.canvas.draw(); plt.pause(0.01)
+        if args.plot_every > 0 and (epoch % args.plot_every == 0 or epoch == args.epochs):
+            fig.savefig(os.path.join(out_dir, f"rasters_epoch_{epoch:03d}.png"), dpi=120)
 
-    out_dir = args.run_dir or "figures"
-    os.makedirs(out_dir, exist_ok=True)
-    fig.savefig(os.path.join(out_dir, "rasters.png"), dpi=120)
+    plt.close(fig)
 
     # Perturbation set: raised-cosine LED at the strongest level, added as a
     # shared current to the driven units each step -> (T, N).
@@ -181,11 +185,11 @@ def train(args):
                   None if light is None else light[gj]) for gj, gi, _ in pairs]
         fig, _, _ = plot_rasters(rows, area_per_neuron, keep, f"{title} — {format_metrics(m)}")
         fig.savefig(os.path.join(out_dir, name), dpi=120)
+        plt.close(fig)
 
     final_plot("test_rasters.png", z_te_bin, None, "test (no perturbation)")
     final_plot("perturbation_rasters.png", z_pert, perturb_current,
                f"perturbation test (drive {int(driven.sum())} inhib units)", light=light)
-    plt.ioff(); plt.show()
 
 
 if __name__ == "__main__":
@@ -198,6 +202,8 @@ if __name__ == "__main__":
     p.add_argument("--coeff_ta", type=float, default=1.0)
     p.add_argument("--coeff_tm", type=float, default=0.3)
     p.add_argument("--opto_intensity", type=float, default=0.5)
+    p.add_argument("--plot-every", type=int, default=5,
+                   help="save a training raster every N epochs (0 = never)")
     p.add_argument("--sign-constrained", action="store_true")
     p.add_argument("--ideal-pv-neurons", action="store_true")
     p.add_argument("--run-dir", default=None)
