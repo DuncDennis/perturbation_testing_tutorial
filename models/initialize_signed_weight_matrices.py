@@ -87,7 +87,7 @@ def init_signed_W(sign_vector, p0=1.0, generator=None):
     W = torch.where(sign_matrix == 0, torch.zeros_like(W), W)
     W = _balance_cols_signed(W, sign_matrix)
     W_signed = W * sign_matrix
-    eig = torch.linalg.eigvals(W_signed)
+    eig = torch.linalg.eigvals(W_signed.cpu())
     max_abs = eig.abs().max()
     if max_abs > 0:
         W_signed = W_signed / max_abs

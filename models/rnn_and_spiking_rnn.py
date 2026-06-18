@@ -55,7 +55,7 @@ class RNN(nn.Module):
         # Force stabilization with matrix eigenalues
 
         spectral_radius_max = 1.2
-        eig = torch.linalg.eigvals(self.W).abs().max()
+        eig = torch.linalg.eigvals(self.W.cpu()).abs().max()
         if eig > spectral_radius_max:
             self.W.data.mul_(spectral_radius_max / eig)
 
