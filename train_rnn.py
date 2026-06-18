@@ -141,11 +141,15 @@ def train(args):
     elif args.model == 'lowBio':
         model = lowBio(n_neurons, sign_vector=sign, num_delays=args.num_delays,
                        area_idx=area_per_neuron, rank=args.rank,
-                       inter_area_dale=args.inter_area_dale).to(device)
+                       inter_area_dale=args.inter_area_dale,
+                       tau_init=args.tau_init,
+                       learn_tau=not args.fixed_tau).to(device)
     elif args.model == 'lowRNN':
         model = lowRNN(n_neurons, area_idx=area_per_neuron, sign_vector=sign,
                        rank=args.rank,
-                       inter_area_dale=args.inter_area_dale).to(device)
+                       inter_area_dale=args.inter_area_dale,
+                       tau_init=args.tau_init,
+                       learn_tau=not args.fixed_tau).to(device)
     else:
         model = RNN(n_neurons, sign_vector=sign).to(device)
     print(f"Model: {args.model}  n_neurons={n_neurons}  device={device}  "
@@ -217,7 +221,8 @@ def train(args):
         metrics["epoch"] = epoch
         epoch_metrics.append(metrics)
         loss_str = "  ".join(f"{k}={np.mean(v):.3f}" for k, v in losses.items())
-        print(f"Epoch {epoch:3d}  {loss_str}  | test {format_metrics(metrics)}")
+        tau_str = (f"  tau={float(model.tau):.3f}" if hasattr(model, "tau") else "")
+        print(f"Epoch {epoch:3d}  {loss_str}{tau_str}  | test {format_metrics(metrics)}")
 
         for (im, sline, fline, bot), dat in zip(
                 gen, [z_pred.mean(0), z_pred[ti], z_pred[tj], z_pred[tk]]):
@@ -309,6 +314,12 @@ if __name__ == "__main__":
     p.add_argument("--coeff_tm", type=float, default=0.3)
     p.add_argument("--rank", type=int, default=2,
                    help="inter-area low-rank (lowRNN / lowBio only)")
+    p.add_argument("--tau-init", type=float, default=2.0, dest="tau_init",
+                   help="initial membrane time constant in time-bins "
+                        "(lowRNN / lowBio only)")
+    p.add_argument("--fixed-tau", action="store_true", dest="fixed_tau",
+                   help="hold the time constant fixed at --tau-init instead of "
+                        "learning it (lowRNN / lowBio only)")
     p.add_argument("--inter-area-dale", action="store_true", dest="inter_area_dale",
                    help="enforce Dale's law for inter-area connections (lowRNN/lowBio only)")
     p.add_argument("--opto-intensities", type=float, nargs="+",
@@ -332,13 +343,15 @@ if __name__ == "__main__":
     if args.run_dir is None:
         is_low = args.model in ("lowRNN", "lowBio")
         rank_suffix = f"_rank{args.rank}" if is_low else ""
+        tau_suffix = (f"_tau{args.tau_init:g}{'fixed' if args.fixed_tau else ''}"
+                      if is_low else "")
         dale_suffix = ("_interdale"
                        if is_low and args.sign_constrained and args.inter_area_dale
                        else "")
         args.run_dir = os.path.join(
             "figures",
             f"{args.model}_{'sign_constrained' if args.sign_constrained else 'unconstrained'}"
-            f"{dale_suffix}{rank_suffix}"
+            f"{dale_suffix}{rank_suffix}{tau_suffix}"
         )
     os.makedirs(args.run_dir, exist_ok=True)
 

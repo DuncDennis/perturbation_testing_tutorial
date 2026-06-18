@@ -1,0 +1,357 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\newcommand{\relu}{\mathrm{relu}}
+\newcommand{\clip}{\mathrm{clip}}
+\newcommand{\Wmat}{\mathbf{W}}
+\newcommand{\xvec}{\mathbf{x}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Perturbation Testing with Rate and Spiking RNNs:\\
+A Tutorial Reproduction with Learnable Time Constants}
+\author{Perturbation Testing Tutorial}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note documents a minimal tutorial pipeline for \emph{perturbation testing}
+of recurrent network models of cortical spontaneous activity, following
+Sourmpis et al.\ (eLife 2026). We fit data-constrained recurrent neural networks
+(RNNs) to Neuropixels recordings from a single Allen Institute session and ask
+whether the fitted models predict the effect of optogenetic stimulation of
+parvalbumin-positive (PV) inhibitory neurons --- a perturbation the model never
+saw during training. We summarise the four network architectures (a vanilla rate
+RNN, a leaky integrate-and-fire spiking RNN, and their low-rank inter-area
+variants), the biological constraints that can be switched on (Dale's law,
+E/I balance, spectral-radius control, inter-area Dale's law), the training
+objective (a trial-averaged plus a trial-matched loss on an oscillation-feature
+embedding), and the evaluation metrics (PSTH correlation, Brain-FID, and
+trial-matched $R^2$). We additionally describe a \textbf{membrane time
+constant} for the low-rank models, parameterised so it stays positive and bounded,
+which can be either learned jointly with the weights or held fixed, and is exposed
+as a swept hyperparameter in the experiment driver.
+\end{abstract}
+
+\section{Overview and goal}
+The aim of perturbation testing is to evaluate a model not on the data
+distribution it was trained on, but on its response to a causal intervention.
+Here the intervention is optogenetic excitation of PV interneurons. A
+spontaneous-activity generator is trained \emph{only} on unperturbed
+gray-screen activity; at test time the recorded optogenetic light waveform
+$i(t)$ is injected into the model's putative inhibitory units, and the model's
+predicted population response is compared against the held-out optogenetic
+recordings. A model that has captured the right recurrent structure should
+generalise to the perturbation; one that has merely memorised the baseline
+statistics should not.
+
+This is a minimal reproduction of Sourmpis et al., eLife 2026
+\cite{sourmpis2026}, using data from the Allen Institute Visual Coding
+Neuropixels dataset \cite{siegle2021}, session \code{829720705}
+(\emph{Pvalb-Cre $\times$ Ai32}, functional-connectivity protocol), which
+combines PV optogenetic stimulation with simultaneous Neuropixels recordings.
+The trial-matching training loss follows Sourmpis et al., NeurIPS 2023
+\cite{sourmpis2023}.
+
+\section{Data}
+\label{sec:data}
+Spike trains from QC-passing units across six visual areas
+(\code{VISp}, \code{VISrl}, \code{VISl}, \code{VISal}, \code{VISpm}, \code{VISam})
+are binned at $\mathrm{dt} = 10$\,ms. Neurons are sorted so they are grouped by
+area, and every neuron carries an area label and a sign label.
+
+\paragraph{Conditions.} Trials are integer-coded: $c = 0$ for spontaneous
+(gray-screen) windows, $c \geq 1$ for drifting gratings, and $c = -1$ for
+optogenetic-perturbation trials. Training and the in-distribution test set use a
+$70/30$ stratified split per condition; the optogenetic trials form a separate
+perturbation set. The generators are trained on the spontaneous block only
+($c=0$), binarised to spikes.
+
+\paragraph{Neuron signs.} Each unit is labelled excitatory ($+1$), inhibitory
+($-1$), or outlier ($0$) from a fast-spiking waveform classifier. Optionally the
+``ideal'' PV labels can instead be derived directly from the perturbation
+itself (units whose firing rises during the high-light phase of the strongest
+raised-cosine trials; flag \code{-{}-ideal-pv-neurons}). Inhibitory/PV units are
+the ones \emph{driven} by the opto light at test time; they are excluded from
+scoring (the light clamps them identically in data and model, so scoring them
+would inflate the metrics).
+
+\paragraph{Perturbation waveforms.} The Allen functional-connectivity protocol
+provides three light waveforms --- single \code{pulse}, \code{fast\_pulses}
+($2.5$\,ms pulses at $10$\,Hz over $1$\,s), and \code{raised\_cosine} --- each at
+three intensity levels $\{1.3, 1.7, 2.0\}$. In-block \code{sham} segments
+(LED-free windows drawn from the gaps between light events) act as a matched
+control. Each perturbation trial is $1.5$\,s long with light onset at $0.5$\,s.
+
+\section{Models}
+\label{sec:models}
+All four models are \emph{spontaneous-activity generators}: there is no external
+stimulus input; recurrent dynamics are driven only by per-neuron Gaussian noise.
+We write the recurrence as $\mathbf{u} = \xvec\Wmat$, so $W_{ij}$ is the weight
+from presynaptic $i$ to postsynaptic $j$. All generators warm-start each call
+from the previous call's detached end state (no backpropagation across calls).
+
+\subsection{Vanilla rate RNN (\code{rnn})}
+A ReLU-like rate unit clipped to $[0,1]$:
+\begin{align}
+\mathbf{u}_t &= \xvec_{t-1}\Wmat + \mathbf{b} + \boldsymbol{\sigma}\odot\boldsymbol{\varepsilon}_t + \mathbf{p}_t, \\
+\xvec_t &= \clip(\mathbf{u}_t,\, 0,\, 1),
+\end{align}
+where $\boldsymbol{\varepsilon}_t \sim \mathcal{N}(0,I)$, $\boldsymbol{\sigma}$ is
+a learnable per-neuron noise scale (initialised to $0.1$ so the noise-driven
+network does not collapse to the zero fixed point), and $\mathbf{p}_t$ is the
+optional perturbation current (zero during training). The output is scaled by a
+learnable scalar.
+
+\subsection{Leaky integrate-and-fire spiking RNN (\code{lif})}
+A spiking variant with a leaky membrane and per-synapse transmission delays.
+Each synapse $i\!\to\!j$ is assigned at initialisation to one of
+\code{num\_delays} delay bins via a one-hot tensor $\Wmat^{(d)}$, so it reads its
+presynaptic spike from its own delay in the past:
+\begin{align}
+\mathbf{u}_t &= \textstyle\sum_{k} \big(\mathbf{z}_{t-k}\big)\big(W^{(d)}_{\cdot\cdot k}\odot \Wmat\big) + \mathbf{b} + \boldsymbol{\sigma}\odot\boldsymbol{\varepsilon}_t + \mathbf{p}_t, \\
+\mathbf{v}_t &= \alpha\,\mathbf{v}_{t-1} + (1-\alpha)\,\mathbf{u}_t - \mathbf{z}_{t-1}\,v_{\mathrm{thr}}, \\
+p_t &= \sigma_{\mathrm{logistic}}\!\big(\beta(\mathbf{v}_t - v_{\mathrm{thr}})\big), \qquad
+\mathbf{z}_t = \mathbb{1}[p_t > 0.5] + (p_t - \mathrm{sg}(p_t)),
+\end{align}
+where $\alpha$ is the membrane leak/retention factor, $v_{\mathrm{thr}}$ the
+firing threshold, and the last term is a straight-through estimator (forward:
+sampled $0/1$ spike; backward: gradient through $p_t = \sigma_{\mathrm{logistic}}$).
+$\mathrm{sg}(\cdot)$ denotes stop-gradient.
+
+\subsection{Low-rank inter-area rate RNN (\code{lowRNN})}
+\label{sec:lowrnn}
+This model imposes \emph{area structure} on the connectivity. The global weight
+matrix is assembled block-wise: each intra-area block is a full $(N_a \times N_a)$
+matrix, while each inter-area block is constrained to rank $R$:
+\begin{equation}
+\Wmat^{(\mathrm{tgt},\mathrm{src})} =
+\begin{cases}
+\Wmat_{\text{full}} & \text{intra-area } (\mathrm{tgt}=\mathrm{src}),\\[2pt]
+M N^{\top} & \text{inter-area, unconstrained},\\[2pt]
+\mathbf{s}_{\mathrm{src}}\odot\big(M N^{\top}\big) & \text{inter-area, Dale-constrained},
+\end{cases}
+\qquad M \in \mathbb{R}^{N_{\mathrm{src}}\times R},\ N \in \mathbb{R}^{N_{\mathrm{tgt}}\times R}.
+\end{equation}
+The dense matrix has its diagonal zeroed. Crucially, the \code{lowRNN} dynamics
+are now \emph{leaky}, with a learnable time constant (Section~\ref{sec:tau}):
+\begin{equation}
+\xvec_t = \alpha\,\xvec_{t-1} + (1-\alpha)\,\clip(\mathbf{u}_t, 0, 1),
+\qquad
+\mathbf{u}_t = \xvec_{t-1}\Wmat_{\text{global}} + \mathbf{b} + \boldsymbol{\sigma}\odot\boldsymbol{\varepsilon}_t + \mathbf{p}_t.
+\label{eq:lowrnn-leaky}
+\end{equation}
+Setting $\alpha \to 0$ recovers the memoryless map $\xvec_t = \clip(\mathbf{u}_t)$
+of the vanilla rate RNN; $\alpha \to 1$ makes the rate change arbitrarily slowly.
+
+\subsection{Low-rank spiking RNN (\code{lowBio})}
+The biological counterpart of \code{lowRNN}: it combines the low-rank/area-block
+connectivity of Section~\ref{sec:lowrnn} with the delayed-synapse LIF dynamics of
+\code{lif}. Its membrane leak $\alpha$ is the same learnable, time-constant--derived
+quantity used by \code{lowRNN}, so its membrane time constant is learned and
+swept as well.
+
+\section{Biological constraints}
+The constraints below are applied at initialisation and re-projected after every
+optimiser step (\code{apply\_constraint}).
+
+\begin{description}[leftmargin=1.4em]
+\item[Dale's law (sign constraint).] With \code{-{}-sign-constrained}, $\Wmat$ is
+initialised sign-constrained and E/I-balanced per column (so the net presynaptic
+drive into each postsynaptic neuron is zero at init), and the signs are
+re-projected after each step (excitatory rows clamped $\geq 0$, inhibitory rows
+$\leq 0$). The construction follows the recipe of \cite{sourmpis2023}.
+\item[Self-connection removal.] The diagonal of $\Wmat$ is held at zero.
+\item[Spectral-radius control.] Because the recurrence has little leak, an
+expansive $\Wmat$ would blow the dynamics up over a trial. After each step the
+spectral radius is re-pinned to at most $1.2$ (the low-rank factors $M, N$ are
+scaled symmetrically by $\sqrt{\cdot}$ so $MN^\top$ scales correctly).
+\item[Inter-area Dale's law.] For the low-rank models, \code{-{}-inter-area-dale}
+additionally sign-constrains the inter-area blocks (the factors $M, N$ are kept
+non-negative and the fixed row-sign vector $\mathbf{s}_{\mathrm{src}}$ supplies
+the sign). Without it, intra-area blocks are sign-constrained but inter-area
+projections are free.
+\end{description}
+
+\section{Membrane time constant: fixed or learnable}
+\label{sec:tau}
+The membrane time constant $\tau$ of the low-rank models (\code{lowRNN} and
+\code{lowBio}) is parameterised in log-space so it is strictly positive for any
+real value, and the per-step retention/leak factor $\alpha$ used in
+Eqs.~(\ref{eq:lowrnn-leaky}) is derived from it:
+\begin{equation}
+\tau = \exp(\theta), \qquad \alpha = \exp(-1/\tau) \in (0,1),
+\end{equation}
+where $\theta$ is the underlying scalar. Larger $\tau$ gives $\alpha$ closer to
+$1$, i.e.\ longer memory and slower dynamics. The initial value $\tau_0$ is set by
+the \code{-{}-tau-init} flag (units of time bins). Because $\alpha \in (0,1)$ and
+$\tau > 0$ are guaranteed by construction, no extra projection is needed in
+\code{apply\_constraint}.
+
+The time constant can be either \textbf{learnable} or \textbf{fixed}:
+\begin{itemize}[leftmargin=1.6em]
+\item \emph{Learnable} (default): $\theta$ is a trained parameter optimised
+jointly with the weights; the network learns its own integration timescale,
+initialised at $\tau_0$. The learned $\tau$ is logged each epoch.
+\item \emph{Fixed} (\code{-{}-fixed-tau}): $\theta$ is held constant as a
+non-trainable buffer, so $\tau \equiv \tau_0$ throughout training. Sweeping
+$\tau_0$ in this mode performs a controlled scan over the time constant.
+\end{itemize}
+In the spiking \code{lowBio} model this same $\alpha$ is the membrane leak, so
+making it learnable directly learns (or, when fixed, prescribes) the neuronal
+integration timescale.
+
+\section{Training objective}
+\label{sec:loss}
+Models are trained to match recorded spontaneous activity through two
+complementary losses computed on low-pass-filtered rasters (a length-$5$ moving
+average), then combined with coefficients $\lambda_{\mathrm{ta}}$ and
+$\lambda_{\mathrm{tm}}$:
+\begin{equation}
+\mathcal{L} = \lambda_{\mathrm{ta}}\,\mathcal{L}_{\mathrm{ta}}
+            + \lambda_{\mathrm{tm}}\,\mathcal{L}_{\mathrm{tm}}.
+\end{equation}
+
+\paragraph{Trial-averaged loss $\mathcal{L}_{\mathrm{ta}}$.} The squared
+difference between the trial-averaged (PSTH) low-passed activity of generated and
+recorded batches. This roughly corresponds to the paper's per-neuron term.
+
+\paragraph{Trial-matched loss $\mathcal{L}_{\mathrm{tm}}$.} Single trials carry
+variability that a PSTH loss ignores. Following \cite{sourmpis2023}, generated
+and recorded trials are embedded with a differentiable feature map
+$\phi(\cdot)$, an optimal one-to-one assignment between the two sets of trials is
+solved on the \emph{detached} cost matrix (Hungarian algorithm), and the MSE over
+matched pairs is minimised (gradient flows through the matched feature entries).
+
+\paragraph{Feature map $\phi$.} Both the differentiable loss (torch) and the
+numpy evaluation share a single feature pipeline so they cannot drift apart:
+(i) average activity within each area to obtain per-area population channels;
+(ii) project each channel onto a bank of log-spaced cosine/sine oscillation
+bands and take per-band amplitudes plus a DC term; (iii) z-score against the
+training-set statistics. Optimisation uses AdamW (learning rate $10^{-3}$, weight
+decay $0.1$); \code{apply\_constraint} runs after each step.
+
+\section{Evaluation metrics}
+\label{sec:metrics}
+Three metrics compare model-generated rasters to held-out recorded rasters of the
+same shape:
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{PSTH Pearson $r$} ($\uparrow$): per-neuron Pearson correlation
+between trial-averaged firing rates (model vs.\ data). Trials need not be matched.
+\item \textbf{Brain-FID} ($\downarrow$): Fr\'echet distance between Gaussian fits
+to the distribution of single-trial feature vectors $\phi(z)$ of model vs.\ data
+(a distribution-level score, in the spirit of the image FID).
+\item \textbf{Trial-matched $R^2$} ($\uparrow$): $R^2$ between optimally matched
+single-trial populations on the same feature embedding $\phi$ used by Brain-FID.
+\end{enumerate}
+Two reference levels frame the scores: \emph{chance baselines} from time-shuffled
+and neuron-shuffled rasters, and an \emph{ideal ceiling} from comparing real
+train data against real test data. Brain-FID and trial-matched $R^2$ deliberately
+share the feature map $\phi$ so the two numbers are consistent.
+
+\paragraph{Perturbation evaluation.} After training, the recorded light waveform
+$i(t)$ for each condition is injected as a perturbation current into the driven
+(PV/inhibitory) units, scaled by an \emph{opto intensity} factor that is swept
+over \code{-{}-opto-intensities}. Metrics are computed on the non-driven units
+only. Conditions span \code{sham} and every (waveform, level) combination present
+in the session.
+
+\section{Settings and experiment sweep}
+\label{sec:settings}
+Table~\ref{tab:settings} lists the command-line settings of \code{train\_rnn.py}.
+Table~\ref{tab:sweep} summarises the full sweep run by \code{run\_baselines.sh}.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Flag & Meaning & Default \\
+\midrule
+\code{-{}-model} & \code{rnn} / \code{lif} / \code{lowRNN} / \code{lowBio} & \code{rnn} \\
+\code{-{}-sign-constrained} & enable Dale's law (sign-constrained, E/I-balanced $\Wmat$) & off \\
+\code{-{}-inter-area-dale} & sign-constrain inter-area blocks (low-rank models) & off \\
+\code{-{}-rank} & inter-area low-rank $R$ (low-rank models) & $2$ \\
+\code{-{}-tau-init} & \textbf{initial/fixed membrane time constant (bins)} & $2.0$ \\
+\code{-{}-fixed-tau} & \textbf{hold $\tau$ fixed at \code{-{}-tau-init} instead of learning it} & off (learnable) \\
+\code{-{}-num-delays} & number of synaptic delay bins (spiking models) & $3$ \\
+\code{-{}-ideal-pv-neurons} & use perturbation-derived PV labels instead of waveform & off \\
+\code{-{}-epochs} & training epochs & $20$ \\
+\code{-{}-batch-size} & trials per batch & $64$ \\
+\code{-{}-lr} & AdamW learning rate & $10^{-3}$ \\
+\code{-{}-coeff\_ta} & weight $\lambda_{\mathrm{ta}}$ of the trial-averaged loss & $1.0$ \\
+\code{-{}-coeff\_tm} & weight $\lambda_{\mathrm{tm}}$ of the trial-matched loss & $0.3$ \\
+\code{-{}-opto-intensities} & perturbation-current scale factors (swept at eval) & $0.1\ 0.5\ 1.0$ \\
+\bottomrule
+\end{tabular}
+\caption{Command-line settings of the training script. The time constant
+(\code{-{}-tau-init}) is the newly added learnable, swept parameter.}
+\label{tab:settings}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Model family & Swept axes & Runs \\
+\midrule
+\code{rnn} & $\{$unconstrained, sign-constrained$\}$ & $2$ \\
+\code{lif} & $\{$unconstrained, sign-constrained$\}$ & $2$ \\
+\code{lowRNN}, \code{lowBio} &
+$\{$unconstr., sign-constr., inter-Dale$\}\times\text{rank}\{1,2,3,4\}\times\tau_0\{1,2,4,8\}$ &
+$2\times 3\times 4\times 4 = 96$ \\
+\midrule
+\multicolumn{2}{l}{\textbf{Total}} & $100$ \\
+\bottomrule
+\end{tabular}
+\caption{Sweep performed by \code{run\_baselines.sh}. The low-rank families now
+sweep the time-constant initialisation $\tau_0$ in addition to rank and the
+constraint configuration. Each run additionally evaluates every opto-intensity in
+\code{-{}-opto-intensities}. Results are written to
+\code{figures/<model>\_<constraint>[\_rank<R>][\_tau<T>]/}.}
+\label{tab:sweep}
+\end{table}
+
+\section{Conclusion}
+The tutorial provides a compact, end-to-end perturbation-testing pipeline:
+data-constrained rate and spiking RNNs, optional biological constraints, a
+trial-matching training objective, and distribution-level metrics evaluated
+under a held-out optogenetic perturbation. The low-rank, area-structured models
+(\code{lowRNN}, \code{lowBio}) now carry a learnable membrane time constant that
+is both fit by gradient descent and swept across initialisations, letting the
+neuronal integration timescale be studied as a first-class hyperparameter
+alongside connectivity rank and Dale's-law constraints.
+
+\begin{thebibliography}{9}
+\bibitem{sourmpis2026}
+G.\ Sourmpis et al.
+\newblock Perturbation testing of data-constrained network models.
+\newblock \emph{eLife}, 2026.
+\newblock \url{https://elifesciences.org/articles/106827}.
+
+\bibitem{sourmpis2023}
+G.\ Sourmpis, C.\ Petersen, W.\ Gerstner, and G.\ Bellec.
+\newblock Trial matching: capturing variability with data-constrained spiking
+neural networks.
+\newblock \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2023.
+\newblock \url{https://papers.neurips.cc/paper_files/paper/2023/hash/ec702dd6e83b2113a43614685a7e2ac6-Abstract-Conference.html}.
+
+\bibitem{siegle2021}
+J.\ H.\ Siegle et al.
+\newblock Survey of spiking in the mouse visual system reveals functional
+hierarchy.
+\newblock \emph{Nature}, 592:86--92, 2021.
+\newblock \url{https://www.nature.com/articles/s41586-020-03171-x}.
+\end{thebibliography}
+
+\end{document}

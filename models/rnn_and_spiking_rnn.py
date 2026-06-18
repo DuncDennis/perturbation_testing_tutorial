@@ -155,7 +155,7 @@ class lowRNN(nn.Module):
     """
 
     def __init__(self, n_neurons, area_idx, sign_vector=None, rank=2,
-                 inter_area_dale=False):
+                 inter_area_dale=False, tau_init=2.0, learn_tau=True):
         super().__init__()
         self.n_neurons = n_neurons
         self.rank = rank
@@ -207,6 +207,27 @@ class lowRNN(nn.Module):
         self.b = nn.Parameter(torch.zeros(n_neurons))
         self.sigma_noise = nn.Parameter(torch.ones(n_neurons) * 0.1)
         self.scale = nn.Parameter(torch.ones(1))
+
+        # Membrane time constant (in units of time-bins), stored in log-space so
+        # tau > 0 for any real value; the recurrence uses the leak / retention
+        # factor al = exp(-1/tau) in (0, 1). Larger tau -> al closer to 1 -> longer
+        # memory (slower dynamics). With learn_tau=True it is a trained Parameter;
+        # with learn_tau=False it is a fixed buffer held at tau_init. lowBio
+        # inherits this and uses `al` as its membrane leak.
+        raw_log_tau = torch.log(torch.tensor(float(tau_init)))
+        if learn_tau:
+            self.raw_log_tau = nn.Parameter(raw_log_tau)
+        else:
+            self.register_buffer("raw_log_tau", raw_log_tau)
+
+    @property
+    def tau(self):
+        return torch.exp(self.raw_log_tau)
+
+    @property
+    def al(self):
+        """Per-step retention/leak factor in (0, 1): al = exp(-1/tau)."""
+        return torch.exp(-1.0 / self.tau)
 
     def get_global_W(self):
         """Assemble regional blocks into a dense (N, N) matrix.
@@ -277,12 +298,16 @@ class lowRNN(nn.Module):
             x = torch.zeros(B, N, device=device)
         else:
             x = state[torch.randint(0, state.shape[0], (B,), device=device)]
+        al = self.al                       # learnable leak / time-constant factor
         out = []
         for t in range(T):
             u = x @ W + self.b + self.sigma_noise * torch.randn_like(x)
             if perturb_current is not None:
                 u = u + perturb_current[t]
-            x = u.clip(min=0, max=1)
+            # Leaky update: retain a fraction `al` of the previous rate and inject
+            # (1-al) of the new (clipped) drive. al->0 recovers the old memoryless
+            # map x = clip(u); al->1 makes the rate change arbitrarily slowly.
+            x = al * x + (1 - al) * u.clip(min=0, max=1)
             out.append(x)
         self._state = x.detach()
         return torch.stack(out, dim=1) * self.scale
@@ -298,11 +323,14 @@ class lowBio(lowRNN):
     `W_d[i,j,k] * W[i,j]` and each synapse reads its presynaptic spike from its
     own delay in the past.
     """ 
-    def __init__(self, n_neurons, sign_vector=None, al=0.5, v_thr=0.1,
-                 num_delays=3, area_idx=None, rank=2, inter_area_dale=False):
+    def __init__(self, n_neurons, sign_vector=None, v_thr=0.1,
+                 num_delays=3, area_idx=None, rank=2, inter_area_dale=False,
+                 tau_init=2.0, learn_tau=True):
         super().__init__(n_neurons, area_idx, sign_vector, rank=rank,
-                         inter_area_dale=inter_area_dale)
-        self.register_buffer("al", torch.tensor(float(al)))
+                         inter_area_dale=inter_area_dale, tau_init=tau_init,
+                         learn_tau=learn_tau)
+        # `al` (membrane leak) is now the learnable, tau-derived property from
+        # lowRNN; it is no longer a fixed buffer set here.
         self.register_buffer("v_thr", torch.tensor(float(v_thr)))
         W_d = nn.functional.one_hot(
             torch.randint(0, num_delays, (n_neurons, n_neurons)), num_delays)
