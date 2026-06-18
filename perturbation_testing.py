@@ -124,10 +124,10 @@ def make_population_oscillation_features_torch(area_per_neuron, z_train,
 
 
     def raw(z_btn):
-        pop = pop_averaged_with_area_torch(z_btn, area_per_neuron)
+        pop = pop_averaged_with_area_torch(z_btn, area_per_neuron) # (B, T, n_areas)
         pop = (pop - pop.mean())
         return feature_oscillation_frequency_torch(
-            pop, dt=dt, f_min=f_min, f_max=f_max, num_f=num_f, n_group=n_group)
+            pop, dt=dt, f_min=f_min, f_max=f_max, num_f=num_f, n_group=n_group) # (B, d_feat)
 
     with torch.no_grad():
         f_train = raw(z_train_torch)

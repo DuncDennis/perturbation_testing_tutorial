@@ -24,6 +24,20 @@ from utils.functions import low_pass
 from utils.plot_rasters import plot_rasters, _share_yscale, matched_pairs
 
 
+class _Tee:
+    """Mirror writes to every stream in the list (e.g. stdout + a log file)."""
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+
 def shuffled_baselines(z_true, seed=0, feature_fun=None):
     """Chance levels: time-shuffle destroys PSTH structure, neuron-shuffle
     reads PSTHs out from the wrong neurons. z is binarised to match the model."""
@@ -105,11 +119,7 @@ def train(args):
 
     # Training raster figure: generated (right) artists are updated in place each epoch
     # and saved every --plot-every epochs.
-    out_dir = args.run_dir or os.path.join(
-        "figures",
-        f"{args.model}_{'sign_constrained' if args.sign_constrained else 'unconstrained'}"
-    )
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir = args.run_dir
     ti, tj = 0, z_te_bin.shape[0] // 2
     examples = lambda gen: [("trial-avg", z_te_bin.mean(0), gen[0], None),
                             (f"trial {ti}", z_te_bin[ti], gen[1], None),
@@ -217,6 +227,19 @@ if __name__ == "__main__":
             args.device = "mps"
         else:
             args.device = "cpu"
-    print(f"Using device: {args.device}")
 
-    train(args)
+    if args.run_dir is None:
+        args.run_dir = os.path.join(
+            "figures",
+            f"{args.model}_{'sign_constrained' if args.sign_constrained else 'unconstrained'}"
+        )
+    os.makedirs(args.run_dir, exist_ok=True)
+
+    _log = open(os.path.join(args.run_dir, "train.log"), "w")
+    sys.stdout = _Tee(sys.__stdout__, _log)
+    try:
+        print(f"Using device: {args.device}")
+        train(args)
+    finally:
+        sys.stdout = sys.__stdout__
+        _log.close()
