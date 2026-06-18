@@ -63,20 +63,25 @@ def shuffled_baselines(z_true, seed=0, feature_fun=None):
 
 
 def _plot_epoch_metrics(epoch_metrics, out_dir, baselines=None, m_ideal=None):
-    """Line plot of PSTH-r / Brain-FID / trial-R² over training epochs."""
+    """Line plot of PSTH-r / Brain-FID / trial-R² over training epochs. In
+    autoregressive mode a 4th panel tracks the matched roll-out R²."""
     epochs = [m["epoch"] for m in epoch_metrics]
     specs = [
         ("psth_pearson_r",   "PSTH Pearson r ↑",  "psth_shuffled_time", "psth_pearson_r"),
         ("brain_fid",        "Brain FID ↓",        "fid_shuffled_time",  "brain_fid"),
         ("trial_matched_r2", "Trial-matched R² ↑", "r2_shuffled_time",   "trial_matched_r2"),
     ]
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
-    for ax, (key, label, bl_key, ideal_key) in zip(axes, specs):
-        ax.plot(epochs, [m[key] for m in epoch_metrics], "o-", ms=3, lw=1.5, label="model")
-        if baselines is not None:
+    if any("rollout_r2" in m for m in epoch_metrics):       # autoregressive mode
+        specs.append(("rollout_r2", "Roll-out matched R² ↑", None, None))
+    fig, axes = plt.subplots(1, len(specs), figsize=(4.3 * len(specs), 4),
+                             constrained_layout=True, squeeze=False)
+    for ax, (key, label, bl_key, ideal_key) in zip(axes[0], specs):
+        ax.plot(epochs, [m.get(key, np.nan) for m in epoch_metrics], "o-",
+                ms=3, lw=1.5, label="model")
+        if baselines is not None and bl_key is not None:
             ax.axhline(baselines[bl_key], color="C3", ls="--", lw=1,
                        alpha=0.8, label="shuffle-time")
-        if m_ideal is not None:
+        if m_ideal is not None and ideal_key is not None:
             ax.axhline(m_ideal[ideal_key], color="C2", ls="--", lw=1,
                        alpha=0.8, label="ideal ceiling")
         ax.set_xlabel("epoch")
@@ -166,6 +171,21 @@ def train(args):
     feature_fun_torch = make_population_oscillation_features_torch(
         area_per_neuron=area_per_neuron, z_train=z_tr_bin_full, dt=DT)
 
+    # Autoregressive (init-from-data roll-out) mode: leading-history length the
+    # init needs, a clamped roll-out length, and energy-band feature fns fit on
+    # R-length crops so their z-score statistics match the roll-out window.
+    h_init = model.history_len
+    R_ar = int(np.clip(args.rollout_len, 6, z_tr_bin_full.shape[1] - h_init))
+    if args.train_mode == "autoregressive":
+        z_tr_crop = z_tr_bin_full[:, :R_ar, :]
+        feature_fun_ar = make_population_oscillation_features(
+            area_per_neuron=area_per_neuron, z_train=z_tr_crop, dt=DT)
+        feature_fun_ar_torch = make_population_oscillation_features_torch(
+            area_per_neuron=area_per_neuron, z_train=z_tr_crop, dt=DT)
+        if R_ar != args.rollout_len:
+            print(f"  [autoregressive] rollout_len clamped to {R_ar} bins "
+                  f"(trial length {z_tr_bin_full.shape[1]}, history {h_init})")
+
     baselines = shuffled_baselines(z_te_bin, feature_fun=feature_fun)
     print("Test-set chance baselines:")
     print(f"  shuffled time   : PSTH-r={baselines['psth_shuffled_time']:+.3f}  "
@@ -195,37 +215,91 @@ def train(args):
         examples([z_te_bin.mean(0), z_te_bin[ti], z_te_bin[tj], z_te_bin[tk]]),
         area_per_neuron, keep, "epoch 0")
 
+    is_ar = args.train_mode == "autoregressive"
     epoch_metrics = []
     for epoch in range(1, args.epochs + 1):
         model.train()
-        losses = {"trial_matched": [], "trial_averaged": []}
+        losses = ({"trial_averaged": [], "rollout_mse": [], "band": []} if is_ar
+                  else {"trial_matched": [], "trial_averaged": []})
         for (z_batch,) in train_dl:
             z_batch = z_batch.to(device, non_blocking=True)   # (B, T, N)
             B, T, N = z_batch.shape
 
             z_gen = model.generate(B, T, device)              # free-running (B, T, N)
             ta_loss = (low_pass(z_gen).mean(0) - low_pass(z_batch).mean(0)).pow(2).mean()
-            tm_loss = trial_matched_mse_loss(low_pass(z_gen), low_pass(z_batch), feature_fun_torch).mean()
 
-            (ta_loss * args.coeff_ta + tm_loss * args.coeff_tm).backward()
+            if is_ar:
+                # Init the state from data, roll out, and match the smoothed
+                # roll-out + energy bands of the SAME trials (matched by
+                # construction — no Hungarian). Several within-trial start offsets
+                # give many initial conditions per batch.
+                mse_acc = z_gen.new_zeros(())
+                band_acc = z_gen.new_zeros(())
+                for t0 in torch.randint(h_init, T - R_ar + 1, (args.n_inits,)).tolist():
+                    z_pre = z_batch[:, t0 - h_init:t0, :]
+                    target = z_batch[:, t0:t0 + R_ar, :]
+                    state = model.init_state_from_data(z_pre)
+                    z_roll = model.generate(B, R_ar, device, init_state=state)
+                    mse_acc = mse_acc + (low_pass(z_roll) - low_pass(target)).pow(2).mean()
+                    band_acc = band_acc + (feature_fun_ar_torch(z_roll)
+                                           - feature_fun_ar_torch(target)).pow(2).mean()
+                mse_loss = mse_acc / args.n_inits
+                band_loss = band_acc / args.n_inits
+                loss = (ta_loss * args.coeff_ta + mse_loss * args.coeff_ar_mse
+                        + band_loss * args.coeff_ar_band)
+            else:
+                tm_loss = trial_matched_mse_loss(
+                    low_pass(z_gen), low_pass(z_batch), feature_fun_torch).mean()
+                loss = ta_loss * args.coeff_ta + tm_loss * args.coeff_tm
+
+            loss.backward()
             opt.step()
             opt.zero_grad()
             model.apply_constraint()
 
             losses["trial_averaged"].append(ta_loss.item())
-            losses["trial_matched"].append(tm_loss.item())
+            if is_ar:
+                losses["rollout_mse"].append(mse_loss.item())
+                losses["band"].append(band_loss.item())
+            else:
+                losses["trial_matched"].append(tm_loss.item())
 
+        # --- free-running generative eval (kept in both modes) ---
         z_pred = model.generate(len(z_te_bin), z_te_bin.shape[1], device=device)
         z_pred = z_pred.detach().cpu().numpy()
         metrics = evaluate(z_pred, z_te_bin, feature_fun=feature_fun, time_last=False)
         metrics["epoch"] = epoch
+        disp = [z_pred.mean(0), z_pred[ti], z_pred[tj], z_pred[tk]]
+
+        if is_ar:
+            # Matched roll-out eval: init all test trials from data and roll out.
+            z_pre_te = torch.as_tensor(z_te_bin[:, :h_init, :],
+                                       dtype=torch.float32, device=device)
+            state_te = model.init_state_from_data(z_pre_te)
+            z_roll_te = model.generate(len(z_te_bin), R_ar, device=device,
+                                       init_state=state_te).detach().cpu().numpy()
+            m_ar = evaluate(z_roll_te, z_te_bin[:, h_init:h_init + R_ar, :],
+                            feature_fun=feature_fun_ar, matched=True, time_last=False)
+            metrics["rollout_r2"] = m_ar["trial_matched_r2"]
+            metrics["rollout_psth_r"] = m_ar["psth_pearson_r"]
+            metrics["rollout_fid"] = m_ar["brain_fid"]
+            # Full-length matched prediction for the raster: data prefix + roll-out
+            # (re-seeded from the same data init so it lines up with the data trial).
+            R_plot = z_te_bin.shape[1] - h_init
+            roll_full = model.generate(len(z_te_bin), R_plot, device=device,
+                                       init_state=model.init_state_from_data(z_pre_te)
+                                       ).detach().cpu().numpy()
+            pred_full = np.concatenate([z_te_bin[:, :h_init, :], roll_full], axis=1)
+            disp = [pred_full.mean(0), pred_full[ti], pred_full[tj], pred_full[tk]]
+
         epoch_metrics.append(metrics)
         loss_str = "  ".join(f"{k}={np.mean(v):.3f}" for k, v in losses.items())
         tau_str = (f"  tau={float(model.tau):.3f}" if hasattr(model, "tau") else "")
-        print(f"Epoch {epoch:3d}  {loss_str}{tau_str}  | test {format_metrics(metrics)}")
+        ar_str = (f"  | rollout R²={metrics['rollout_r2']:+.3f}"
+                  if "rollout_r2" in metrics else "")
+        print(f"Epoch {epoch:3d}  {loss_str}{tau_str}  | test {format_metrics(metrics)}{ar_str}")
 
-        for (im, sline, fline, bot), dat in zip(
-                gen, [z_pred.mean(0), z_pred[ti], z_pred[tj], z_pred[tk]]):
+        for (im, sline, fline, bot), dat in zip(gen, disp):
             im.set_data(dat.T)
             sline.set_ydata(dat[:, keep].mean(1))
             if fline is not None:
@@ -312,6 +386,21 @@ if __name__ == "__main__":
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--coeff_ta", type=float, default=1.0)
     p.add_argument("--coeff_tm", type=float, default=0.3)
+    p.add_argument("--train-mode", choices=["trialmatch", "autoregressive"],
+                   default="trialmatch", dest="train_mode",
+                   help="trialmatch: free-running PSTH + optimal-transport "
+                        "trial-matched loss (default). autoregressive: init the "
+                        "state from data and roll out, matching the smoothed "
+                        "roll-out + energy bands of the SAME trials.")
+    p.add_argument("--rollout-len", type=int, default=50, dest="rollout_len",
+                   help="roll-out length in time-bins (autoregressive mode)")
+    p.add_argument("--n-inits", type=int, default=4, dest="n_inits",
+                   help="within-trial initial conditions per batch "
+                        "(autoregressive mode)")
+    p.add_argument("--coeff_ar_mse", type=float, default=1.0,
+                   help="weight of the smoothed roll-out MSE (autoregressive mode)")
+    p.add_argument("--coeff_ar_band", type=float, default=0.3,
+                   help="weight of the matched energy-band MSE (autoregressive mode)")
     p.add_argument("--rank", type=int, default=2,
                    help="inter-area low-rank (lowRNN / lowBio only)")
     p.add_argument("--tau-init", type=float, default=2.0, dest="tau_init",
@@ -348,10 +437,12 @@ if __name__ == "__main__":
         dale_suffix = ("_interdale"
                        if is_low and args.sign_constrained and args.inter_area_dale
                        else "")
+        mode_suffix = (f"_ar_R{args.rollout_len}"
+                       if args.train_mode == "autoregressive" else "")
         args.run_dir = os.path.join(
             "figures",
             f"{args.model}_{'sign_constrained' if args.sign_constrained else 'unconstrained'}"
-            f"{dale_suffix}{rank_suffix}{tau_suffix}"
+            f"{dale_suffix}{rank_suffix}{tau_suffix}{mode_suffix}"
         )
     os.makedirs(args.run_dir, exist_ok=True)
 

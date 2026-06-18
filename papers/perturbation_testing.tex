@@ -327,6 +327,70 @@ level, and its inferred inputs complicate clean perturbation counterfactuals.
 Distribution-level generative models of spikes (GANs, latent diffusion) share the
 ``match the distribution'' goal with very different, less mechanistic machinery.
 
+\section{Autoregressive training mode (alternative objective)}
+\label{sec:autoregressive}
+As a deliberate counterpoint to the free-running, distribution-matching objective
+of Section~\ref{sec:loss}, the pipeline also offers an \textbf{autoregressive
+roll-out} objective, selected with \code{-{}-train-mode autoregressive} (the
+default remains \code{trialmatch}). Here the network state is initialised
+\emph{from data} and rolled out open-loop, and the prediction is matched to the
+\emph{same} trials --- so trial correspondence is given by construction and no
+optimal-transport assignment is needed.
+
+\subsection{Procedure}
+For a recorded trial $\mathbf{z}^{\mathcal{D}}$ and a start bin $t_0$, the state
+is seeded from the data and the model free-runs for $R$ steps
+(\code{-{}-rollout-len}), producing $\hat{\mathbf z}_{t_0:t_0+R}$:
+\begin{itemize}[leftmargin=1.6em]
+\item \emph{Rate models} (\code{rnn}, \code{lowRNN}): the rate state is set to the
+last observed bin, $\xvec_{t_0-1} = \mathbf{z}^{\mathcal{D}}_{t_0-1}$.
+\item \emph{Spiking models} (\code{lif}, \code{lowBio}): the delayed-spike buffer
+is filled with the last \code{num\_delays} recorded bins and the membrane is
+started at $\mathbf{v}=0$ (an approximation; the first steps are a transient).
+\end{itemize}
+Several start bins $t_0$ are sampled \emph{within} each trial per batch
+(\code{-{}-n-inits}), yielding many initial conditions. The roll-out is open-loop
+(the network feeds back its own output --- no teacher forcing during the roll-out);
+only the initial condition comes from data. As in the free-running mode, gradients
+flow within the roll-out but the persistent warm-start buffer is left untouched.
+
+\subsection{Losses}
+The trial-matching term $\mathcal{L}_{\mathrm{tm}}$ is dropped. The objective is
+\begin{equation}
+\mathcal{L} = \lambda_{\mathrm{ta}}\,\mathcal{L}_{\mathrm{ta}}
+            + \lambda_{\mathrm{mse}}\,\mathcal{L}_{\mathrm{roll}}
+            + \lambda_{\mathrm{band}}\,\mathcal{L}_{\mathrm{band}},
+\end{equation}
+where (i) $\mathcal{L}_{\mathrm{ta}}$ is the same free-running trial-averaged PSTH
+loss as before (it still constrains global per-neuron means); (ii)
+$\mathcal{L}_{\mathrm{roll}}$ is the element-wise MSE between the low-pass-filtered
+roll-out and the matched data segment,
+$\|\,\mathrm{lp}(\hat{\mathbf z}) - \mathrm{lp}(\mathbf z^{\mathcal{D}}_{t_0:t_0+R})\,\|^2$;
+and (iii) $\mathcal{L}_{\mathrm{band}}$ is the MSE between the oscillation-band
+features $\phi$ of the roll-out and of the \emph{same} data segment --- the same
+embedding as $\mathcal{L}_{\mathrm{tm}}$ but with the trials matched by
+construction (no Hungarian step). Coefficients are \code{-{}-coeff\_ta},
+\code{-{}-coeff\_ar\_mse}, \code{-{}-coeff\_ar\_band}. Because the roll-out is
+stochastic, the smoothing keeps $\mathcal{L}_{\mathrm{roll}}$ meaningful only for
+the low-frequency, short-horizon component; the band term carries the oscillation
+content over the window. Since the features are integrated over the $R$-bin window,
+their normalisation statistics are refit on $R$-length crops of the training data
+so the lowest bands remain comparable.
+
+\subsection{Effect on metrics and plots}
+The free-running generative metrics of Section~\ref{sec:metrics} (PSTH-$r$,
+Brain-FID, optimal-transport $R^2$) are still computed each epoch. In addition, a
+\textbf{matched roll-out} evaluation is reported: test trials are seeded from data,
+rolled out for $R$ steps, and scored against the matched data segment with the
+trial order preserved (the $\mathtt{matched}{=}\mathrm{True}$ path), giving a
+matched roll-out $R^2$ that becomes the primary tracked quantity and adds a fourth
+panel to the over-epochs figure. The training raster switches from free-running
+samples to a \emph{matched prediction}: each data trial is shown beside its own
+roll-out (data prefix followed by the open-loop continuation). The
+perturbation-testing evaluation is \textbf{unchanged} --- it remains free-running
+with the injected opto current, since the counterfactual has no spikes to seed
+from (Section~\ref{sec:theory}).
+
 \section{Evaluation metrics}
 \label{sec:metrics}
 Three metrics compare model-generated rasters to held-out recorded rasters of the
@@ -377,6 +441,11 @@ Flag & Meaning & Default \\
 \code{-{}-lr} & AdamW learning rate & $10^{-3}$ \\
 \code{-{}-coeff\_ta} & weight $\lambda_{\mathrm{ta}}$ of the trial-averaged loss & $1.0$ \\
 \code{-{}-coeff\_tm} & weight $\lambda_{\mathrm{tm}}$ of the trial-matched loss & $0.3$ \\
+\code{-{}-train-mode} & \textbf{\code{trialmatch} / \code{autoregressive}} (Section~\ref{sec:autoregressive}) & \code{trialmatch} \\
+\code{-{}-rollout-len} & \textbf{roll-out length $R$ in bins (autoregressive)} & $50$ \\
+\code{-{}-n-inits} & \textbf{within-trial initial conditions per batch (autoregressive)} & $4$ \\
+\code{-{}-coeff\_ar\_mse} & \textbf{weight $\lambda_{\mathrm{mse}}$ of the roll-out MSE (autoregressive)} & $1.0$ \\
+\code{-{}-coeff\_ar\_band} & \textbf{weight $\lambda_{\mathrm{band}}$ of the matched-band MSE (autoregressive)} & $0.3$ \\
 \code{-{}-opto-intensities} & perturbation-current scale factors (swept at eval) & $0.1\ 0.5\ 1.0$ \\
 \bottomrule
 \end{tabular}

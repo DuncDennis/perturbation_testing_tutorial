@@ -17,6 +17,12 @@ EPOCHS=20
 RANKS="1 2 3 4"
 TAUS="1 2 4 8"
 
+# Set RUN_AR=1 to also train a few representative models in the autoregressive
+# (init-from-data roll-out) mode instead of the default free-running trial-match
+# objective. Kept as a small set (not a full cross-product) to bound runtime.
+RUN_AR="${RUN_AR:-0}"
+AR_ROLLOUT=50
+
 # ── RNN ──────────────────────────────────────────────────────────────────────
 echo "=== RNN  unconstrained ==="
 $PYTHON train_rnn.py --model rnn --epochs $EPOCHS
@@ -49,6 +55,20 @@ for MODEL in lowRNN lowBio; do
         done
     done
 done
+
+# ── Autoregressive (init-from-data roll-out) mode — optional, representative ──
+if [ "$RUN_AR" = "1" ]; then
+    for MODEL in lowRNN lowBio; do
+        echo "=== $MODEL  autoregressive  rank=2  rollout=$AR_ROLLOUT ==="
+        $PYTHON train_rnn.py --model $MODEL --train-mode autoregressive \
+            --rollout-len $AR_ROLLOUT --epochs $EPOCHS --rank 2
+
+        echo "=== $MODEL  sign-constrained  autoregressive  rank=2  rollout=$AR_ROLLOUT ==="
+        $PYTHON train_rnn.py --model $MODEL --sign-constrained \
+            --train-mode autoregressive --rollout-len $AR_ROLLOUT \
+            --epochs $EPOCHS --rank 2
+    done
+fi
 
 echo ""
 echo "Done. Output directories:"
