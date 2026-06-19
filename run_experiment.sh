@@ -36,7 +36,7 @@ set -uo pipefail
 
 OUT="${1:-figure_experiments}"
 PYTHON="${PYTHON:-.venv/bin/python}"
-EPOCHS="${EPOCHS:-20}"
+EPOCHS="${EPOCHS:-100}"
 DEVICE="${DEVICE:-auto}"
 
 OPTO="0.01 0.1 1.0"     # opto light intensities swept at evaluation (per run)
