@@ -60,19 +60,34 @@ class RNN(nn.Module):
         if eig > spectral_radius_max:
             self.W.data.mul_(spectral_radius_max / eig)
 
-    def generate(self, B, T, device=None, perturb_current=None):
+    # Number of leading data bins needed to build an init state (rate: just the
+    # last bin). Used by the autoregressive (init-from-data) training mode.
+    history_len = 1
+
+    def init_state_from_data(self, z_pre):
+        """Build a roll-out init state from recent data. `z_pre` is (B, k, N)
+        binary data; the rate state is initialised to the most recent bin."""
+        return z_pre[:, -1, :]
+
+    def generate(self, B, T, device=None, perturb_current=None, init_state=None):
         # perturb_current: (T, N) added to the pre-activation — the PV-opto hook
         # (+ve drives a unit, large -ve silences it via the ReLU floor).
+        # init_state: (B, N) rate vector to start from (autoregressive roll-out
+        # from data). When given, the warm-start buffer is left untouched.
         device = device or next(self.parameters()).device
         N = self.W.shape[1]
         # Warm-start from the previous call's DETACHED end state (no BPTT across
         # calls). Resample B rows (with replacement) from the stored batch so any
         # batch size works; cold-start from zeros only on the very first call.
-        state = getattr(self, "_state", None)
-        if state is None:
-            x = torch.zeros(B, N, device=device)
+        if init_state is not None:
+            x = init_state
+            B = x.shape[0]
         else:
-            x = state[torch.randint(0, state.shape[0], (B,), device=device)]
+            state = getattr(self, "_state", None)
+            if state is None:
+                x = torch.zeros(B, N, device=device)
+            else:
+                x = state[torch.randint(0, state.shape[0], (B,), device=device)]
         out = []
         for t in range(T):
             u = x @ self.W + self.b + self.sigma_noise * torch.randn_like(x)
@@ -80,8 +95,19 @@ class RNN(nn.Module):
                 u = u + perturb_current[t]
             x = u.clip(min=0, max=1)
             out.append(x)
-        self._state = x.detach()
+        if init_state is None:
+            self._state = x.detach()
         return torch.stack(out, dim=1) * self.scale
+
+
+def _spiking_init_from_data(z_pre, n_delays):
+    """Build a (z_buffer, v) roll-out init state for a spiking model from recent
+    data. `z_pre` is (B, k, N) binary data with k >= n_delays; the spike buffer
+    is the last `n_delays` data bins (index 0 = oldest, -1 = newest) and the
+    membrane is started at v=0 (approximate — the first steps are a transient)."""
+    z_buffer = [z_pre[:, -n_delays + i, :] for i in range(n_delays)]
+    v = torch.zeros_like(z_pre[:, -1, :])
+    return z_buffer, v
 
 
 class LIF(RNN):
@@ -104,24 +130,37 @@ class LIF(RNN):
         self.register_buffer("W_d", W_d)            # (N, N, num_delays) one-hot
         self.temp = 1 #nn.Parameter(torch.ones(1) * 0.1)
 
+    @property
+    def history_len(self):
+        return self.W_d.shape[-1]                    # n_delays leading bins needed
 
-    def generate(self, B, T, device=None, perturb_current=None):
+    def init_state_from_data(self, z_pre):
+        """(z_buffer, v) roll-out init from the last n_delays bins of `z_pre`."""
+        return _spiking_init_from_data(z_pre, self.W_d.shape[-1])
+
+    def generate(self, B, T, device=None, perturb_current=None, init_state=None):
         device = device or next(self.parameters()).device
         N, n_delays = self.W.shape[1], self.W_d.shape[-1]
         # Warm-start the spike buffer (feeds the delayed einsum) AND the membrane
         # from the previous call's DETACHED state. Resample B rows with SHARED
         # indices (so a new trial is seeded consistently across delays and v) for
         # any batch size; cold-start from zeros only on the very first call.
-        state = getattr(self, "_state", None)
-        if state is None:
-            p0 = 0.01 * 5 # approx 5Hz
-            #z_buffer = [torch.zeros(B, N, device=device) for _ in range(n_delays)]
-            z_buffer = [(torch.rand(B, N, device=device) < p0).float() for _ in range(n_delays)]
-            v = torch.zeros(B, N, device=device)
+        # init_state=(z_buffer, v): start a roll-out from data (warm-start buffer
+        # left untouched).
+        if init_state is not None:
+            z_buffer, v = init_state
+            B = v.shape[0]
         else:
-            idx = torch.randint(0, state[0].shape[0], (B,), device=device)
-            z_buffer = [s[idx] for s in state]
-            v = self._v[idx]
+            state = getattr(self, "_state", None)
+            if state is None:
+                p0 = 0.01 * 5 # approx 5Hz
+                #z_buffer = [torch.zeros(B, N, device=device) for _ in range(n_delays)]
+                z_buffer = [(torch.rand(B, N, device=device) < p0).float() for _ in range(n_delays)]
+                v = torch.zeros(B, N, device=device)
+            else:
+                idx = torch.randint(0, state[0].shape[0], (B,), device=device)
+                z_buffer = [s[idx] for s in state]
+                v = self._v[idx]
         W = torch.einsum("ijk,ij->ijk", self.W_d, self.W)   # delayed weight tensor
         out = []
         for t in range(T):
@@ -136,8 +175,9 @@ class LIF(RNN):
             z = p + (hard - p).detach()             # straight-through spike
             z_buffer = z_buffer[1:] + [z]
             out.append(z)
-        self._state = [zz.detach() for zz in z_buffer]
-        self._v = v.detach()
+        if init_state is None:
+            self._state = [zz.detach() for zz in z_buffer]
+            self._v = v.detach()
         return torch.stack(out, dim=1)
 
 class lowRNN(nn.Module):
@@ -155,7 +195,7 @@ class lowRNN(nn.Module):
     """
 
     def __init__(self, n_neurons, area_idx, sign_vector=None, rank=2,
-                 inter_area_dale=False):
+                 inter_area_dale=False, tau_init=2.0, learn_tau=True):
         super().__init__()
         self.n_neurons = n_neurons
         self.rank = rank
@@ -207,6 +247,27 @@ class lowRNN(nn.Module):
         self.b = nn.Parameter(torch.zeros(n_neurons))
         self.sigma_noise = nn.Parameter(torch.ones(n_neurons) * 0.1)
         self.scale = nn.Parameter(torch.ones(1))
+
+        # Membrane time constant (in units of time-bins), stored in log-space so
+        # tau > 0 for any real value; the recurrence uses the leak / retention
+        # factor al = exp(-1/tau) in (0, 1). Larger tau -> al closer to 1 -> longer
+        # memory (slower dynamics). With learn_tau=True it is a trained Parameter;
+        # with learn_tau=False it is a fixed buffer held at tau_init. lowBio
+        # inherits this and uses `al` as its membrane leak.
+        raw_log_tau = torch.log(torch.tensor(float(tau_init)))
+        if learn_tau:
+            self.raw_log_tau = nn.Parameter(raw_log_tau)
+        else:
+            self.register_buffer("raw_log_tau", raw_log_tau)
+
+    @property
+    def tau(self):
+        return torch.exp(self.raw_log_tau)
+
+    @property
+    def al(self):
+        """Per-step retention/leak factor in (0, 1): al = exp(-1/tau)."""
+        return torch.exp(-1.0 / self.tau)
 
     def get_global_W(self):
         """Assemble regional blocks into a dense (N, N) matrix.
@@ -263,28 +324,47 @@ class lowRNN(nn.Module):
                     block["M"].data.mul_(sq)
                     block["N"].data.mul_(sq)
 
-    def generate(self, B, T, device=None, perturb_current=None):
+    # Rate state: a single bin of leading data suffices to initialise a roll-out.
+    history_len = 1
+
+    def init_state_from_data(self, z_pre):
+        """Build a roll-out init state from recent data. `z_pre` is (B, k, N)
+        binary data; the rate state is initialised to the most recent bin."""
+        return z_pre[:, -1, :]
+
+    def generate(self, B, T, device=None, perturb_current=None, init_state=None):
         # perturb_current: (T, N) added to the pre-activation — the PV-opto hook
         # (+ve drives a unit, large -ve silences it via the ReLU floor).
+        # init_state: (B, N) rate vector to start from (autoregressive roll-out
+        # from data). When given, the warm-start buffer is left untouched.
         device = device or next(self.parameters()).device
         W = self.get_global_W()
         N = W.shape[1]
         # Warm-start from the previous call's DETACHED end state (no BPTT across
         # calls). Resample B rows (with replacement) from the stored batch so any
         # batch size works; cold-start from zeros only on the very first call.
-        state = getattr(self, "_state", None)
-        if state is None:
-            x = torch.zeros(B, N, device=device)
+        if init_state is not None:
+            x = init_state
+            B = x.shape[0]
         else:
-            x = state[torch.randint(0, state.shape[0], (B,), device=device)]
+            state = getattr(self, "_state", None)
+            if state is None:
+                x = torch.zeros(B, N, device=device)
+            else:
+                x = state[torch.randint(0, state.shape[0], (B,), device=device)]
+        al = self.al                       # learnable leak / time-constant factor
         out = []
         for t in range(T):
             u = x @ W + self.b + self.sigma_noise * torch.randn_like(x)
             if perturb_current is not None:
                 u = u + perturb_current[t]
-            x = u.clip(min=0, max=1)
+            # Leaky update: retain a fraction `al` of the previous rate and inject
+            # (1-al) of the new (clipped) drive. al->0 recovers the old memoryless
+            # map x = clip(u); al->1 makes the rate change arbitrarily slowly.
+            x = al * x + (1 - al) * u.clip(min=0, max=1)
             out.append(x)
-        self._state = x.detach()
+        if init_state is None:
+            self._state = x.detach()
         return torch.stack(out, dim=1) * self.scale
 
 class lowBio(lowRNN):
@@ -298,18 +378,29 @@ class lowBio(lowRNN):
     `W_d[i,j,k] * W[i,j]` and each synapse reads its presynaptic spike from its
     own delay in the past.
     """ 
-    def __init__(self, n_neurons, sign_vector=None, al=0.5, v_thr=0.1,
-                 num_delays=3, area_idx=None, rank=2, inter_area_dale=False):
+    def __init__(self, n_neurons, sign_vector=None, v_thr=0.1,
+                 num_delays=3, area_idx=None, rank=2, inter_area_dale=False,
+                 tau_init=2.0, learn_tau=True):
         super().__init__(n_neurons, area_idx, sign_vector, rank=rank,
-                         inter_area_dale=inter_area_dale)
-        self.register_buffer("al", torch.tensor(float(al)))
+                         inter_area_dale=inter_area_dale, tau_init=tau_init,
+                         learn_tau=learn_tau)
+        # `al` (membrane leak) is now the learnable, tau-derived property from
+        # lowRNN; it is no longer a fixed buffer set here.
         self.register_buffer("v_thr", torch.tensor(float(v_thr)))
         W_d = nn.functional.one_hot(
             torch.randint(0, num_delays, (n_neurons, n_neurons)), num_delays)
         self.register_buffer("W_d", W_d)            # (N, N, num_delays) one-hot
         self.temp = 1 #nn.Parameter(torch.ones(1) * 0.1)
-        
-    def generate(self, B, T, device=None, perturb_current=None):
+
+    @property
+    def history_len(self):
+        return self.W_d.shape[-1]                    # n_delays leading bins needed
+
+    def init_state_from_data(self, z_pre):
+        """(z_buffer, v) roll-out init from the last n_delays bins of `z_pre`."""
+        return _spiking_init_from_data(z_pre, self.W_d.shape[-1])
+
+    def generate(self, B, T, device=None, perturb_current=None, init_state=None):
         device = device or next(self.parameters()).device
         W_global = self.get_global_W()
         N, n_delays = W_global.shape[1], self.W_d.shape[-1]
@@ -317,16 +408,22 @@ class lowBio(lowRNN):
         # from the previous call's DETACHED state. Resample B rows with SHARED
         # indices (so a new trial is seeded consistently across delays and v) for
         # any batch size; cold-start from zeros only on the very first call.
-        state = getattr(self, "_state", None)
-        if state is None:
-            p0 = 0.01 * 5 # approx 5Hz
-            #z_buffer = [torch.zeros(B, N, device=device) for _ in range(n_delays)]
-            z_buffer = [(torch.rand(B, N, device=device) < p0).float() for _ in range(n_delays)]
-            v = torch.zeros(B, N, device=device)
+        # init_state=(z_buffer, v): start a roll-out from data (warm-start buffer
+        # left untouched).
+        if init_state is not None:
+            z_buffer, v = init_state
+            B = v.shape[0]
         else:
-            idx = torch.randint(0, state[0].shape[0], (B,), device=device)
-            z_buffer = [s[idx] for s in state]
-            v = self._v[idx]
+            state = getattr(self, "_state", None)
+            if state is None:
+                p0 = 0.01 * 5 # approx 5Hz
+                #z_buffer = [torch.zeros(B, N, device=device) for _ in range(n_delays)]
+                z_buffer = [(torch.rand(B, N, device=device) < p0).float() for _ in range(n_delays)]
+                v = torch.zeros(B, N, device=device)
+            else:
+                idx = torch.randint(0, state[0].shape[0], (B,), device=device)
+                z_buffer = [s[idx] for s in state]
+                v = self._v[idx]
         W = torch.einsum("ijk,ij->ijk", self.W_d, W_global)   # delayed weight tensor
         out = []
         for t in range(T):
@@ -341,8 +438,9 @@ class lowBio(lowRNN):
             z = p + (hard - p).detach()             # straight-through spike
             z_buffer = z_buffer[1:] + [z]
             out.append(z)
-        self._state = [zz.detach() for zz in z_buffer]
-        self._v = v.detach()
+        if init_state is None:
+            self._state = [zz.detach() for zz in z_buffer]
+            self._v = v.detach()
         return torch.stack(out, dim=1)
 
 
