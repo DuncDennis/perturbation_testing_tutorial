@@ -2,6 +2,7 @@
 
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath,amssymb}
+\usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{array}
 \usepackage{enumitem}
@@ -477,6 +478,145 @@ constraint configuration. Each run additionally evaluates every opto-intensity i
 \code{figures/<model>\_<constraint>[\_rank<R>][\_tau<T>]/}.}
 \label{tab:sweep}
 \end{table}
+
+\section{Results}
+\label{sec:results}
+We report results from the sweep of Section~\ref{sec:settings}, evaluated on the
+held-out in-distribution test set (free-running spontaneous activity) and on the
+held-out optogenetic perturbation set. All figures are produced directly by the
+experiment driver and live under \code{figure\_experiments/}; the per-run metrics
+are aggregated in \code{metrics\_summary.csv} (free-running and matched roll-out
+scores) and \code{perturbation\_metrics.csv} (per-condition perturbation scores).
+Unless noted, the qualitative panels use the best-scoring free-running
+configuration, \code{lowBio} with Dale's law, rank $2$ and $\tau_0=2$.
+
+\subsection{Training converges on the free-running metrics}
+Figure~\ref{fig:epochs} shows the three free-running metrics over training for a
+representative low-rank spiking model. The Brain-FID drops from $\sim\!170$ at
+initialisation to below the time-shuffle chance level within a few epochs and
+settles near the ideal ceiling (real-train vs.\ real-test), while the
+trial-matched $R^2$ rises above chance to $\approx 0.6$. The PSTH Pearson $r$
+stays near zero throughout: with noise-driven generators and no stimulus, the
+per-neuron trial-averaged trace carries little signal, so the distribution-level
+scores (Brain-FID, trial-$R^2$) are the informative ones --- exactly the
+motivation for the sample-and-measure objective of Section~\ref{sec:theory}.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../figure_experiments/freerun/lowBio_dale_rank2_tau2/metrics_over_epochs.png}
+\caption{Free-running metrics over training for \code{lowBio}, Dale's law, rank
+$2$, $\tau_0=2$. Left: PSTH Pearson $r$; middle: Brain-FID ($\downarrow$); right:
+trial-matched $R^2$ ($\uparrow$). Dashed red is the time-shuffle chance level,
+dashed green the real-train vs.\ real-test ideal ceiling.}
+\label{fig:epochs}
+\end{figure}
+
+\subsection{Free-running fit across models}
+Table~\ref{tab:freerun} summarises the free-running test scores for one
+representative configuration per model family (best $\tau_0$/rank for the low-rank
+models). Two patterns are robust across the sweep. First, the area-structured
+low-rank models (\code{lowRNN}, \code{lowBio}) reach the lowest Brain-FID and the
+highest trial-$R^2$, with the spiking \code{lowBio} best overall (Brain-FID
+$\approx 2.8$, trial-$R^2\approx 0.63$), well inside the chance--ceiling band.
+Second, the free-running, distribution-matching objective decisively beats the
+autoregressive roll-out objective on these distribution-level scores: in
+autoregressive mode the free-running Brain-FID and trial-$R^2$ collapse (most
+configurations score negative trial-$R^2$; cf.\ the \code{ar} rows of
+\code{metrics\_summary.csv}), consistent with the exposure-bias argument of
+Section~\ref{sec:theory}. The matched roll-out $R^2$ that the autoregressive mode
+optimises stays modest ($\lesssim 0.16$), i.e.\ open-loop prediction of single
+spontaneous trials remains hard even when trials are matched by construction.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}llccc@{}}
+\toprule
+Model & Constraint & rank,\,$\tau_0$ & Brain-FID $\downarrow$ & trial-$R^2$ $\uparrow$ \\
+\midrule
+\code{rnn}    & unconstrained & ---       & $8.41$  & $0.458$ \\
+\code{rnn}    & Dale          & ---       & $14.71$ & $0.165$ \\
+\code{lif}    & unconstrained & ---       & $8.94$  & $0.355$ \\
+\code{lif}    & Dale          & ---       & $6.92$  & $0.501$ \\
+\code{lowRNN} & Dale          & $2,\,2$   & $4.52$  & $0.609$ \\
+\code{lowBio} & Dale          & $2,\,2$   & $\mathbf{2.79}$  & $\mathbf{0.630}$ \\
+\bottomrule
+\end{tabular}
+\caption{Free-running test metrics (\code{freerun} mode) for representative
+configurations. Lower Brain-FID and higher trial-$R^2$ are better. The
+area-structured low-rank models dominate, and the spiking \code{lowBio} is best.}
+\label{tab:freerun}
+\end{table}
+
+\subsection{Perturbation testing}
+The decisive test is the held-out optogenetic perturbation, which no model saw
+during training. Figures~\ref{fig:pert-fid} and~\ref{fig:pert-r2} sweep the
+raised-cosine perturbation: each panel plots a metric against the recorded light
+intensity ($1.3$, $1.7$, $2.0$), with one row per training mode
+(\code{freerun}/\code{ar}) and one column per opto-injection scale
+(\code{-{}-opto-intensities} $\in\{0.01,0.1,1.0\}$); lines are means over rank and
+$\tau_0$ per model family, and the dashed traces are the no-perturbation baseline.
+Performance degrades markedly relative to the free-running fit: Brain-FID rises
+well above its unperturbed value and trial-$R^2$ frequently goes negative, i.e.\
+predicting the causal effect of PV stimulation is substantially harder than
+matching spontaneous statistics --- the expected and scientifically interesting
+outcome of perturbation testing. The per-run heatmap of Figure~\ref{fig:heatmap}
+shows this is consistent across the full sweep (columns are opto-scale\,$\times$
+light-strength), with the low-rank spiking models again the least degraded.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../figure_experiments/cosine_brain_fid.png}
+\caption{Raised-cosine perturbation, Brain-FID ($\downarrow$) vs.\ light strength.
+Rows: training mode (\code{freerun}, top; \code{ar}, bottom). Columns: opto
+injection scale. Solid lines are model families (mean over rank/$\tau_0$); dashed
+lines are the no-perturbation baseline.}
+\label{fig:pert-fid}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../figure_experiments/cosine_trial_r2.png}
+\caption{Raised-cosine perturbation, trial-matched $R^2$ ($\uparrow$) vs.\ light
+strength, same layout as Figure~\ref{fig:pert-fid}. Values frequently fall below
+zero, quantifying how much harder the held-out perturbation is than the
+free-running fit.}
+\label{fig:pert-r2}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../figure_experiments/cosine_fid_heatmap.png}
+\caption{Per-run Brain-FID under the raised-cosine perturbation (log colour
+scale). Rows are individual runs (model\,$\times$\,constraint\,$\times$\,rank\,$\times\,\tau_0$),
+columns are opto-scale\,$\times$\,light-strength; \code{freerun} (left) vs.\
+\code{ar} (right).}
+\label{fig:heatmap}
+\end{figure}
+
+\subsection{Qualitative perturbation response}
+Figure~\ref{fig:pert-raster} shows ground-truth (left) vs.\ generated (right)
+rasters for the strongest raised-cosine condition. The model's trial-averaged
+population activity (top panels) clearly tracks the injected raised-cosine light
+waveform, so the network does produce a perturbation-locked response of roughly
+the right gross shape; but the single-trial structure (lower panels) and the
+amplitude/timing details diverge from the data, which is why the quantitative
+trial-$R^2$ for this condition is poor despite the qualitatively sensible drive.
+This gap between a plausible mean response and a correct single-trial
+distribution is precisely what the distribution-level perturbation metrics are
+designed to expose.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.82\linewidth]{../figure_experiments/freerun/lowBio_dale_rank2_tau2/opto_1.00/perturbation_raised_cosine_l2.0.png}
+\caption{Qualitative perturbation prediction (\code{lowBio}, Dale, rank $2$,
+$\tau_0=2$, opto scale $1.0$, raised-cosine $l=2.0$). Left: recorded; right:
+generated. Top row: trial-averaged population activity (blue) overlaid on the
+injected light waveform (orange); lower rows: example single trials with per-area
+rasters. The generated mean follows the light, while single-trial details
+diverge.}
+\label{fig:pert-raster}
+\end{figure}
 
 \section{Conclusion}
 The tutorial provides a compact, end-to-end perturbation-testing pipeline:
